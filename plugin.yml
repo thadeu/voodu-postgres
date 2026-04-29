@@ -1,0 +1,10 @@
+name: postgres
+version: 0.1.0
+description: Voodu database plugin that provisions Postgres via the statefulset kind.
+homepage: https://github.com/thadeu/voodu-postgres
+
+commands:
+  - name: create
+    help: Provision a new Postgres instance ($VOODU_DB_NAME) as a single-node statefulset.
+  - name: destroy
+    help: Tear down the Postgres statefulset for $VOODU_DB_NAME (preserves volumes).

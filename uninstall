@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# uninstall — lifecycle hook run by `voodu plugins:remove postgres`.
+#
+# Drops the voodu-postgres binary. Database statefulsets the
+# operator created remain — they're owned by voodu's statefulset
+# kind, not this plugin. To wipe a postgres database:
+#
+#   vd delete database/<name>            # the manifest + plugin destroy
+#   vd delete statefulset/databases/<name> --prune   # also remove volumes
+#
+# Idempotent: missing binary is fine.
+
+set -euo pipefail
+
+PLUGIN_DIR="${VOODU_PLUGIN_DIR:-$(cd "$(dirname "$0")" && pwd)}"
+PLUGIN_BIN="$PLUGIN_DIR/bin/voodu-postgres"
+
+log() { printf '[voodu-postgres/uninstall] %s\n' "$*"; }
+
+if [ "$(id -u)" -ne 0 ]; then
+  log "must run as root"
+  exit 1
+fi
+
+if [ -f "$PLUGIN_BIN" ]; then
+  rm -f "$PLUGIN_BIN"
+  log "removed $PLUGIN_BIN"
+fi
+
+log "any postgres statefulsets the plugin spawned still live —"
+log "use \`vd delete database/<name>\` and \`vd delete statefulset/databases/<name> --prune\` to wipe"

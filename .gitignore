@@ -1,0 +1,4 @@
+bin/voodu-postgres
+dist/
+*.test
+coverage.out

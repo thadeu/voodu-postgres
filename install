@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# install — lifecycle hook run by `voodu plugins:install postgres`.
+#
+# Responsibilities:
+#   1. Download the voodu-postgres plugin binary into
+#      $VOODU_PLUGIN_DIR/bin/voodu-postgres
+#   2. (Nothing else — postgres instances are spawned per database
+#      manifest by the statefulset reconciler. This plugin owns the
+#      database-kind contract; runtime containers are voodu's
+#      statefulset, not this plugin's.)
+#
+# Idempotent: safe to run repeatedly. A fresh download replaces the
+# existing binary so version bumps propagate.
+
+set -euo pipefail
+
+PLUGIN_DIR="${VOODU_PLUGIN_DIR:-$(cd "$(dirname "$0")" && pwd)}"
+PLUGIN_BIN="$PLUGIN_DIR/bin/voodu-postgres"
+RELEASE_REPO="${VOODU_POSTGRES_RELEASE_REPO:-thadeu/voodu-postgres}"
+
+log() { printf '[voodu-postgres/install] %s\n' "$*"; }
+
+arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
+  esac
+}
+
+install_voodu_postgres() {
+  local version
+  version="$(grep '^version:' "$PLUGIN_DIR/plugin.yml" | awk '{print $2}')"
+
+  if [ -z "$version" ]; then
+    log "could not read version from $PLUGIN_DIR/plugin.yml" >&2
+    exit 1
+  fi
+
+  if [ -x "$PLUGIN_BIN" ] && "$PLUGIN_BIN" --version 2>/dev/null | grep -q "$version"; then
+    log "voodu-postgres v$version already installed at $PLUGIN_BIN"
+    return
+  fi
+
+  local a
+  a="$(arch)"
+
+  local url="https://github.com/${RELEASE_REPO}/releases/download/v${version}/voodu-postgres_linux_${a}"
+
+  log "downloading voodu-postgres v$version ($a) from $url"
+
+  mkdir -p "$(dirname "$PLUGIN_BIN")"
+
+  local tmp
+  tmp="$(mktemp)"
+
+  if ! curl -fsSL "$url" -o "$tmp"; then
+    rm -f "$tmp"
+    log "failed to download voodu-postgres binary from $url" >&2
+    log "make sure release v$version was published with the linux_${a} asset" >&2
+    exit 1
+  fi
+
+  install -m 0755 "$tmp" "$PLUGIN_BIN"
+  rm -f "$tmp"
+
+  log "installed $PLUGIN_BIN"
+}
+
+main() {
+  if [ "$(id -u)" -ne 0 ]; then
+    log "this script must run as root (invoked by controller via plugins:install)"
+    exit 1
+  fi
+
+  if ! command -v curl >/dev/null 2>&1; then
+    log "curl is required but not found on PATH" >&2
+    exit 1
+  fi
+
+  install_voodu_postgres
+}
+
+main "$@"
