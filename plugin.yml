@@ -1,10 +1,8 @@
 name: postgres
-version: 0.1.0
-description: Voodu database plugin that provisions Postgres via the statefulset kind.
+version: 0.2.0
+description: Voodu macro plugin that expands `postgres { ... }` HCL blocks into statefulset manifests.
 homepage: https://github.com/thadeu/voodu-postgres
 
 commands:
-  - name: create
-    help: Provision a new Postgres instance ($VOODU_DB_NAME) as a single-node statefulset.
-  - name: destroy
-    help: Tear down the Postgres statefulset for $VOODU_DB_NAME (preserves volumes).
+  - name: expand
+    help: Macro entrypoint — read expand request from stdin, emit statefulset manifest envelope on stdout. Invoked by the controller during `vd apply`; not meant for direct use.

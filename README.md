@@ -1,33 +1,21 @@
 # voodu-postgres
 
-Voodu database plugin that materialises `database "<name>" { engine = "postgres" }` manifests into a single-node postgres statefulset.
+Voodu macro plugin that expands a `postgres { … }` HCL block into a statefulset manifest.
 
-## What it does
+The plugin is a **dumb alias of statefulset with sensible defaults** — every statefulset attribute the operator declares wins; the plugin only fills in what's missing. Custom config (postgresql.conf, pg_hba.conf, certs) flows through the `asset` kind, not via plugin knobs.
 
-Given a manifest like:
+## Defaults
 
-```hcl
-database "main" {
-  engine  = "postgres"
-  version = "15"
-
-  params = {
-    password = "optional-explicit-password"
-  }
-}
-```
-
-the plugin's `create` command POSTs an equivalent statefulset manifest to the voodu controller, scoped under `databases`:
+Bare block — `postgres "data" "main" {}` — produces:
 
 ```hcl
-statefulset "databases" "main" {
+statefulset "data" "main" {
   image    = "postgres:15"
   replicas = 1
 
   env = {
-    POSTGRES_PASSWORD = "<resolved-or-generated>"
-    POSTGRES_DB       = "main"
-    PGDATA            = "/var/lib/postgresql/data/pgdata"
+    POSTGRES_DB = "main"
+    PGDATA      = "/var/lib/postgresql/data/pgdata"
   }
 
   ports = ["5432"]
@@ -38,62 +26,127 @@ statefulset "databases" "main" {
 }
 ```
 
-Other apps reach the running database through voodu's per-pod alias: `${ref.database.main.host}` resolves to `main-0.databases`.
+Print the skeleton at any time:
 
-## Connection coordinates
+```bash
+voodu-postgres defaults
+```
 
-After `vd apply -f voodu.hcl`, the plugin's `create` envelope is persisted at `/status/databases/<name>`. Available reference fields:
+## Production hardening — via `asset`
 
-- `${ref.database.<name>.host}` — `<name>-0.databases` (DNS-resolvable on `voodu0`)
-- `${ref.database.<name>.port}` — `5432`
-- `${ref.database.<name>.username}` — `postgres`
-- `${ref.database.<name>.password}` — generated hex (or whatever you set in `params.password`)
-- `${ref.database.<name>.database}` — same as `<name>`
-- `${ref.database.<name>.url}` — `postgres://postgres:PASSWORD@HOST:5432/DBNAME?sslmode=disable`
+Custom postgresql.conf / pg_hba.conf are declared as a sibling `asset` block and referenced from the postgres block via `${asset.<name>.<key>}`:
+
+```hcl
+asset "data" "pg-config" {
+  postgresql_conf = file("./pg/postgresql.conf")
+  pg_hba_conf     = url("https://r2.example.com/configs/pg_hba.conf")
+}
+
+postgres "data" "main" {
+  image = "postgres:15-alpine"
+
+  command = [
+    "postgres",
+    "-c", "config_file=/etc/postgresql/postgresql.conf",
+    "-c", "hba_file=/etc/postgresql/pg_hba.conf",
+  ]
+
+  volumes = [
+    "${asset.pg-config.postgresql_conf}:/etc/postgresql/postgresql.conf:ro",
+    "${asset.pg-config.pg_hba_conf}:/etc/postgresql/pg_hba.conf:ro",
+  ]
+}
+```
+
+Server materialises the asset bytes (file content embedded by CLI, URL fetched + cached server-side), interpolates `${asset.pg-config.X}` to real host paths, mounts as bind volumes. Asset content drift triggers rolling restart automatically (the asset hash folds into the statefulset spec hash).
+
+The plugin doesn't know any of this happened. It's a dumb alias — operator owns the wiring.
+
+## Override anything
+
+Every statefulset attribute is exposed by virtue of the alias model. Operator-declared values win on conflict.
+
+```hcl
+postgres "data" "main" {
+  image = "postgres:15-alpine"
+
+  # Bind on private interface only.
+  ports = ["10.0.0.5:5432:5432"]
+
+  # Custom env merges with defaults.
+  env = {
+    POSTGRES_INITDB_ARGS = "--data-checksums"
+  }
+
+  # Disable persistent storage (tmpfs-only — test fixtures).
+  volume_claims = []
+}
+```
+
+## Connecting from another app
+
+Connection coordinates are NOT exposed via `${ref.…}` — secrets belong in `vd config set`:
+
+```bash
+PG_PASS=$(openssl rand -hex 16)
+vd config set -s data -n main POSTGRES_PASSWORD=$PG_PASS
+vd config set -s myapp DATABASE_URL="postgres://postgres:$PG_PASS@main-0.data:5432/main"
+vd apply -f voodu.hcl
+```
+
+## Storage
+
+Each ordinal of the underlying statefulset gets a docker named volume `voodu-<scope>-<name>-data-<ordinal>`. Volumes survive restarts, image bumps, scale-down, and `vd delete <kind>/<scope>/<name>`. Wipe explicitly:
+
+```bash
+vd delete statefulset/data/main --prune
+```
 
 ## Install
+
+JIT-installed by `vd apply` on first apply containing a `postgres { … }` block. Pin manually:
 
 ```bash
 vd plugins:install postgres --repo thadeu/voodu-postgres
 ```
 
-The install hook downloads the matching tagged binary from GitHub releases into `$VOODU_PLUGIN_DIR/bin/voodu-postgres`.
+Override source repo per-block (forks, internal mirrors):
 
-## Storage
+```hcl
+postgres "data" "main" {
+  _repo = "myorg/voodu-postgres-fork"
+  image = "postgres:15-alpine"
+}
+```
 
-Each ordinal of the underlying statefulset gets a docker named volume: `voodu-databases-<name>-data-<ordinal>`. Volumes survive:
+## Plugin contract
 
-- container restarts
-- statefulset rolling restarts
-- spec drift (image bumps, env changes)
-- statefulset scale-down (the volume of the dropped ordinal stays)
-- `vd delete database/<name>` (the database manifest is removed; the statefulset is destroyed; volumes are kept)
-
-Volumes are destroyed only when the operator explicitly opts in:
+`expand` reads stdin and writes a statefulset envelope:
 
 ```bash
-vd delete statefulset/databases/<name> --prune
+echo '{"kind":"postgres","scope":"data","name":"main"}' | voodu-postgres expand
+# {"status":"ok","data":{"kind":"statefulset",…}}
 ```
+
+Merge rules:
+
+- `env`: deep merge (operator adds keys, defaults preserved unless overwritten)
+- everything else: operator-wins shallow
+- `volume_claims = []` (or any explicitly empty list/map): default dropped
 
 ## Limitations
 
-- Single-node only. Replication topology (primary at pod-0, followers running `pg_basebackup` against it) is on the roadmap.
-- Re-create with no `params.password` generates a fresh password and the previous data becomes unreadable. Workaround: always pin a password via `params.password` once you have one in hand, or use the same `params` block across re-applies.
-- `VOODU_DB_STORAGE` (e.g. `"10Gi"`) is currently informational. Docker volumes have no native quota; a future driver (loop-mount on a sized image, ZFS quota) will honour it.
+- Single-node only. Replication topology lands later.
+- Plugin doesn't generate or rotate the postgres password — `vd config set` territory.
 
 ## Development
 
 ```bash
-make build         # builds bin/voodu-postgres for the host arch
-make test          # runs unit tests
-make lint          # go vet
-make cross         # cross-compiles linux amd64 + arm64 to dist/
-```
+make build
+make test
+make cross
 
-Local install against a voodu controller running on the same host:
-
-```bash
-sudo make install-local PLUGINS_ROOT=/opt/voodu/plugins
+echo '{"kind":"postgres","scope":"data","name":"main"}' | bin/voodu-postgres expand
 ```
 
 ## License
