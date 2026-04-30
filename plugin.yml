@@ -1,8 +1,13 @@
 name: postgres
-version: 0.2.0
-description: Voodu macro plugin that expands `postgres { ... }` HCL blocks into statefulset manifests.
+version: 0.2.1
+description: >
+  Voodu macro plugin that expands postgres { ... } HCL blocks into
+  statefulset manifests.
 homepage: https://github.com/thadeu/voodu-postgres
 
 commands:
   - name: expand
-    help: Macro entrypoint — read expand request from stdin, emit statefulset manifest envelope on stdout. Invoked by the controller during `vd apply`; not meant for direct use.
+    help: >
+      Macro entrypoint invoked by the controller during apply.
+      Reads an expand request from stdin and emits a statefulset
+      manifest envelope on stdout.
