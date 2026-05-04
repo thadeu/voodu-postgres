@@ -269,21 +269,60 @@ postgres "clowk-lp" "db" {
   # config from shared buckets (e.g. shared AWS creds)
   env_from = ["aws/cli", "monitoring/secrets"]
 
-  # resource limits
-  cpu    = "2"
-  memory = "4Gi"
-
   # custom health check (overrides plugin's pg_isready default)
   health_check = "pg_isready -U appuser -d appdata -p 5432"
 
-  # node pinning
-  labels = {
-    workload = "database"
+  # kernel-level CPU/memory caps via cgroups
+  resources {
+    limits {
+      cpu    = "2"      # 2 cpus (or "500m" for 0.5 cpu, k8s-style millicores)
+      memory = "4Gi"    # 4 GiB (binary; "4G" for decimal SI; "1024" plain bytes)
+    }
   }
+
+  # build-mode (instead of image = "...") — Dockerfile + workdir + lang { }
+  # see "Custom image (extensions baked)" below
 }
 ```
 
 Plugin-owned fields (`database`, `user`, `password`, `port`, `initdb_locale`, `initdb_encoding`, `pg_config`, `extensions`, `wal_archive`, `replication_user`) are stripped from the merged spec before emitting — they don't leak to the statefulset wire shape.
+
+#### Resource limits
+
+`resources { limits { ... } }` translates to `docker run --cpus=<n> --memory=<bytes>` on every replica pod. Two layers of constraint apply to postgres:
+
+1. **Container-level (this block)** — kernel cap via cgroups. OOM-kills the postgres process if it exceeds memory limit. Sane budget = host RAM × 0.7 ÷ replicas, leaving headroom for other workloads.
+2. **App-level (`pg_config`)** — postgres-internal allocations. Should be SMALLER than the container cap so postgres self-limits before the kernel kills it.
+
+Recommended pairing for a `memory = "4Gi"` container limit:
+
+```hcl
+resources {
+  limits {
+    cpu    = "2"
+    memory = "4Gi"
+  }
+}
+
+pg_config = {
+  shared_buffers       = "1GB"     # ~25% of container limit
+  effective_cache_size = "3GB"     # ~75% of container limit
+  work_mem             = "16MB"    # per-query, watch for high concurrency
+  max_connections      = 200
+}
+```
+
+Value formats accepted (k8s parity):
+
+| Type | Form | Examples |
+|---|---|---|
+| CPU | decimal | `"2"`, `"1.5"`, `"0.25"` |
+| CPU | millicores | `"500m"` (= 0.5), `"100m"` (= 0.1) |
+| Memory | binary (1024-based, preferred) | `"4Gi"`, `"512Mi"`, `"256Ki"` |
+| Memory | decimal SI (1000-based) | `"4G"`, `"500M"`, `"1500K"` |
+| Memory | plain bytes | `"4294967296"` |
+
+Omit `resources { }` entirely or leave individual fields empty for "no limit" — docker daemon defaults apply (effectively unlimited until host RAM is exhausted).
 
 ---
 
