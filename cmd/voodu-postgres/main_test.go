@@ -34,7 +34,7 @@ import (
 
 func TestComposeStatefulsetDefaults_DefaultShape(t *testing.T) {
 	spec := mustParse(t, nil)
-	got := composeStatefulsetDefaults("clowk-lp", "db", spec, "test-password", "repl-pw", 0, defaultWALArchiveSpec(), false)
+	got := composeStatefulsetDefaults("clowk-lp", "db", spec, "test-password", "repl-pw", 0, testWALPlan("clowk-lp", "db"), false)
 
 	// Image / replicas / port → top-level passthrough fields.
 	if got["image"] != defaultImage {
@@ -70,7 +70,7 @@ func TestComposeStatefulsetDefaults_EnvCarriesPostgresImageContract(t *testing.T
 		"port":     5433,
 	})
 
-	got := composeStatefulsetDefaults("scope", "name", spec, "deadbeef", "repl-pw", 0, defaultWALArchiveSpec(), false)
+	got := composeStatefulsetDefaults("scope", "name", spec, "deadbeef", "repl-pw", 0, testWALPlan("scope", "name"), false)
 
 	env, ok := got["env"].(map[string]any)
 	if !ok {
@@ -105,7 +105,7 @@ func TestComposeStatefulsetDefaults_InitdbArgsHonourLocaleAndEncoding(t *testing
 		"initdb_encoding": "LATIN1",
 	})
 
-	got := composeStatefulsetDefaults("s", "n", spec, "pw", "repl-pw", 0, defaultWALArchiveSpec(), false)
+	got := composeStatefulsetDefaults("s", "n", spec, "pw", "repl-pw", 0, testWALPlan("s", "n"), false)
 
 	env := got["env"].(map[string]any)
 	want := "--locale=pt_BR.UTF-8 --encoding=LATIN1"
@@ -141,7 +141,7 @@ func TestComposeStatefulsetDefaults_UnscopedUsesThreeSegmentAssetRefs(t *testing
 	// the emitted volumes list must use the 3-segment form, not
 	// the 4-segment "${asset..name.key}" broken shape.
 	spec := mustParse(t, nil)
-	got := composeStatefulsetDefaults("", "db", spec, "pw", "repl-pw", 0, defaultWALArchiveSpec(), false)
+	got := composeStatefulsetDefaults("", "db", spec, "pw", "repl-pw", 0, testWALPlan("", "db"), false)
 
 	vols, _ := got["volumes"].([]any)
 
@@ -174,7 +174,7 @@ func TestComposeStatefulsetDefaults_VolumesIncludeAllAssetBinds(t *testing.T) {
 	// M-P3: streaming_conf + init_replication_sh). The (scope,
 	// name) is interpolated into the asset ref.
 	spec := mustParse(t, nil)
-	got := composeStatefulsetDefaults("clowk-lp", "db", spec, "pw", "repl-pw", 0, defaultWALArchiveSpec(), false)
+	got := composeStatefulsetDefaults("clowk-lp", "db", spec, "pw", "repl-pw", 0, testWALPlan("clowk-lp", "db"), false)
 
 	vols, ok := got["volumes"].([]any)
 	if !ok {
@@ -184,7 +184,7 @@ func TestComposeStatefulsetDefaults_VolumesIncludeAllAssetBinds(t *testing.T) {
 	wantSubstrs := []string{
 		"${asset.clowk-lp.db.entrypoint}:" + entrypointMountPath + ":ro",
 		"${asset.clowk-lp.db.pg_overrides_conf}:" + pgOverridesMountPath + ":ro",
-		"${asset.clowk-lp.db.wal_archive_conf}:" + walArchiveMountPath + ":ro",
+		"${asset.clowk-lp.db.wal_archive_conf}:" + walArchiveConfMountPath + ":ro",
 		"${asset.clowk-lp.db.streaming_conf}:" + streamingConfMountPath + ":ro",
 		"${asset.clowk-lp.db.init_replication_sh}:" + initReplicationMountPath + ":ro",
 	}
@@ -205,79 +205,96 @@ func TestComposeStatefulsetDefaults_VolumesIncludeAllAssetBinds(t *testing.T) {
 	}
 }
 
-func TestComposeStatefulsetDefaults_VolumeClaimsForDataAndWALWhenEnabled(t *testing.T) {
-	// WAL archive enabled (default) → 2 volume_claims: data + wal-archive.
+func TestComposeStatefulsetDefaults_OnlyDataClaimAfterHostPathMigration(t *testing.T) {
+	// Post-host_path migration: WAL archive is a host bind-mount,
+	// NOT a per-pod volume_claim. So volume_claims has only
+	// `data`. The wal_archive bind shows up in `volumes`
+	// (verified separately).
 	spec := mustParse(t, nil)
-	got := composeStatefulsetDefaults("s", "n", spec, "pw", "repl-pw", 0, defaultWALArchiveSpec(), false)
-
-	claims, ok := got["volume_claims"].([]any)
-	if !ok || len(claims) != 2 {
-		t.Fatalf("expected 2 volume_claims (data + wal-archive), got: %v", got["volume_claims"])
-	}
-
-	gotByName := map[string]map[string]any{}
-
-	for _, c := range claims {
-		m, ok := c.(map[string]any)
-		if !ok {
-			t.Fatalf("volume_claim entry not a map: %T", c)
-		}
-
-		gotByName[m["name"].(string)] = m
-	}
-
-	if data := gotByName["data"]; data == nil || data["mount_path"] != "/var/lib/postgresql/data" {
-		t.Errorf("data claim missing or wrong mount_path: %+v", data)
-	}
-
-	if wal := gotByName["wal-archive"]; wal == nil || wal["mount_path"] != "/wal-archive" {
-		t.Errorf("wal-archive claim missing or wrong mount_path: %+v", wal)
-	}
-}
-
-func TestComposeStatefulsetDefaults_VolumeClaimsOnlyDataWhenWALDisabled(t *testing.T) {
-	// WAL archive disabled → only the data claim. The wal_archive
-	// asset bind is still emitted (header-only file) so the
-	// shape stays consistent across enable/disable flips, but no
-	// second volume_claim is provisioned (operator opted out of
-	// the disk usage).
-	spec := mustParse(t, nil)
-	disabled := &walArchiveSpec{Enabled: false}
-	got := composeStatefulsetDefaults("s", "n", spec, "pw", "repl-pw", 0, disabled, false)
+	got := composeStatefulsetDefaults("s", "n", spec, "pw", "repl-pw", 0, testWALPlan("s", "n"), false)
 
 	claims, ok := got["volume_claims"].([]any)
 	if !ok || len(claims) != 1 {
-		t.Fatalf("expected 1 volume_claim (data only) when WAL disabled, got: %v", got["volume_claims"])
+		t.Fatalf("expected 1 volume_claim (data only), got: %v", got["volume_claims"])
 	}
 
 	c := claims[0].(map[string]any)
-	if c["name"] != "data" {
-		t.Errorf("expected data claim, got: %+v", c)
+	if c["name"] != "data" || c["mount_path"] != "/var/lib/postgresql/data" {
+		t.Errorf("data claim wrong: %+v", c)
 	}
 }
 
-func TestComposeStatefulsetDefaults_WALArchiveCustomMountPath(t *testing.T) {
-	// Operator-overridden mount_path flows into the volume_claim.
+func TestComposeStatefulsetDefaults_LocalStrategyDefaultDestination(t *testing.T) {
+	// Default destination = /opt/voodu/backups/<scope>/<name>.
+	// Bind-mount appears in `volumes`, mounted :rw on every pod.
 	spec := mustParse(t, nil)
-	walSpec := &walArchiveSpec{Enabled: true, MountPath: "/srv/wal"}
-	got := composeStatefulsetDefaults("s", "n", spec, "pw", "repl-pw", 0, walSpec, false)
+	got := composeStatefulsetDefaults("clowk-lp", "db", spec, "pw", "repl-pw", 0, testWALPlan("clowk-lp", "db"), false)
 
-	claims := got["volume_claims"].([]any)
+	vols, _ := got["volumes"].([]any)
 
-	var walClaim map[string]any
-	for _, c := range claims {
-		if m, ok := c.(map[string]any); ok && m["name"] == "wal-archive" {
-			walClaim = m
+	wantBind := "/opt/voodu/backups/clowk-lp/db:/wal-archive:rw"
+	found := false
+
+	for _, v := range vols {
+		if s, ok := v.(string); ok && s == wantBind {
+			found = true
 			break
 		}
 	}
 
-	if walClaim == nil {
-		t.Fatal("wal-archive claim missing")
+	if !found {
+		t.Errorf("expected bind-mount %q in volumes, got: %v", wantBind, vols)
+	}
+}
+
+func TestComposeStatefulsetDefaults_LocalStrategyOperatorDestination(t *testing.T) {
+	// Operator-supplied destination overrides the default.
+	spec := mustParse(t, nil)
+	walSpec := &walArchiveSpec{
+		Enabled:     true,
+		Strategy:    "local",
+		Destination: "/srv/custom/db-wal",
+	}
+	walPlan := localStrategy{}.Apply(walSpec, "s", "n")
+
+	got := composeStatefulsetDefaults("s", "n", spec, "pw", "repl-pw", 0, walPlan, false)
+
+	vols, _ := got["volumes"].([]any)
+
+	wantBind := "/srv/custom/db-wal:/wal-archive:rw"
+	found := false
+
+	for _, v := range vols {
+		if s, ok := v.(string); ok && s == wantBind {
+			found = true
+			break
+		}
 	}
 
-	if walClaim["mount_path"] != "/srv/wal" {
-		t.Errorf("expected mount_path=/srv/wal, got %v", walClaim["mount_path"])
+	if !found {
+		t.Errorf("expected bind %q in volumes, got: %v", wantBind, vols)
+	}
+}
+
+func TestComposeStatefulsetDefaults_NoBindMountWhenWALDisabled(t *testing.T) {
+	// Disabled wal_archive → empty plan → no host bind. The
+	// wal_archive asset .conf bind stays (header-only file) so
+	// the asset shape across enable/disable flips is consistent.
+	spec := mustParse(t, nil)
+	emptyPlan := walArchivePlan{}
+
+	got := composeStatefulsetDefaults("s", "n", spec, "pw", "repl-pw", 0, emptyPlan, false)
+
+	vols, _ := got["volumes"].([]any)
+
+	for _, v := range vols {
+		s, _ := v.(string)
+		// Reject any host:/wal-archive:rw bind. The asset .conf
+		// bind has the form ${asset.X.Y.Z}:<conf-path>:ro and
+		// shouldn't trip this check.
+		if strings.Contains(s, ":/wal-archive:rw") {
+			t.Errorf("disabled wal_archive should NOT emit host bind-mount: %q", s)
+		}
 	}
 }
 
@@ -285,7 +302,7 @@ func TestComposeStatefulsetDefaults_ScopeSuffixForUnscopedResource(t *testing.T)
 	// Empty scope flows into PG_SCOPE_SUFFIX as ".voodu" (no
 	// double-dot). Unscoped resources are rare but valid.
 	spec := mustParse(t, nil)
-	got := composeStatefulsetDefaults("", "name", spec, "pw", "repl-pw", 0, defaultWALArchiveSpec(), false)
+	got := composeStatefulsetDefaults("", "name", spec, "pw", "repl-pw", 0, testWALPlan("", "name"), false)
 
 	env := got["env"].(map[string]any)
 	if env["PG_SCOPE_SUFFIX"] != ".voodu" {
@@ -297,7 +314,7 @@ func TestComposeStatefulsetDefaults_PrimaryOrdinalFlowsIntoEnv(t *testing.T) {
 	// M-P5 will flip PG_PRIMARY_ORDINAL via failover; pinning
 	// that the value flows from the parameter into the env.
 	spec := mustParse(t, nil)
-	got := composeStatefulsetDefaults("s", "n", spec, "pw", "repl-pw", 2, defaultWALArchiveSpec(), false)
+	got := composeStatefulsetDefaults("s", "n", spec, "pw", "repl-pw", 2, testWALPlan("s", "n"), false)
 
 	env := got["env"].(map[string]any)
 	if env["PG_PRIMARY_ORDINAL"] != "2" {
@@ -314,7 +331,7 @@ func TestComposeStatefulsetDefaults_HealthCheckUsesPgIsready(t *testing.T) {
 		"port":     5433,
 	})
 
-	got := composeStatefulsetDefaults("s", "n", spec, "pw", "repl-pw", 0, defaultWALArchiveSpec(), false)
+	got := composeStatefulsetDefaults("s", "n", spec, "pw", "repl-pw", 0, testWALPlan("s", "n"), false)
 
 	if got["health_check"] != "pg_isready -U appuser -d appdata -p 5433" {
 		t.Errorf("health_check: got %v", got["health_check"])
@@ -537,4 +554,12 @@ func mustParse(t *testing.T, in map[string]any) *postgresSpec {
 	}
 
 	return spec
+}
+
+// testWALPlan computes the walArchivePlan for the default (enabled,
+// local strategy) WAL archive at the given scope/name. Used by tests
+// that exercise composeStatefulsetDefaults without caring about WAL
+// specifics — production code goes through selectStrategy in cmdExpand.
+func testWALPlan(scope, name string) walArchivePlan {
+	return localStrategy{}.Apply(defaultWALArchiveSpec(), scope, name)
 }

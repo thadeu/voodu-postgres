@@ -1,55 +1,42 @@
-// WAL archive: parse, validate, and render the postgres
+// WAL archive: parse, validate, and dispatch the postgres
 // `archive_mode` + `archive_command` config that lets a primary
-// stream WAL files into a separate volume for PITR + standby
-// catch-up.
+// stream WAL files out for PITR + standby catch-up.
 //
-// # Default behaviour (M-P2)
+// # Strategy abstraction
 //
-//   - Enabled by default. Operator who doesn't want the extra
-//     volume + I/O overhead opts out via
-//     `wal_archive { enabled = false }`.
+// The operator picks a strategy via `wal_archive { strategy = "..." }`:
 //
-//   - Default mount path is /wal-archive (a sibling volume_claim
-//     of the data dir). Operator can override the path but the
-//     plugin always provisions the second volume_claim — there's
-//     no way to "use my existing dir" because we want PITR
-//     guarantees.
+//   - "local" (default) — bind-mount a host directory at /wal-archive
+//     inside every pod; archive_command does an idempotent local cp.
+//     Destination is the host path. Pre-flight: operator mkdirs +
+//     chowns to postgres uid 999.
+//   - "s3" / "r2" / "nfs" / "rsync" — FUTURE. Each future strategy
+//     lives in its own strategy_<name>.go and implements the
+//     walArchiveStrategy interface below. Plugin dispatches via
+//     selectStrategy(name).
 //
-//   - Default archive_command writes locally with an idempotency
-//     guard:
+// Until the alternative strategies ship, "local" is the only valid
+// value. Setting `strategy = "s3"` today returns a "strategy unknown"
+// error at apply time.
 //
-//	'test ! -f /wal-archive/%f && cp %p /wal-archive/%f'
+// # Defaults
 //
-//     This is the form postgres docs recommend (rejects rewrites
-//     that would otherwise corrupt the archive on retry).
+// Block omitted entirely → enabled, strategy = "local", destination =
+// /opt/voodu/backups/<scope>/<name>. Operator override is one line:
 //
-//   - Operator override for S3/R2/NFS goes via `pg_config = { ... }`
-//     setting `archive_command` to an `aws s3 cp` / `rclone copy`
-//     / etc. invocation. The env_from = ["aws/cli"] pattern from
-//     the shared-config-bucket doc carries credentials.
-//
-// # Cleanup
-//
-// Plugin DOES NOT manage WAL retention. The archive grows
-// unbounded under default settings. Operator declares a cronjob
-// alongside the postgres resource (mirroring the
-// voodu-redis backup automation pattern):
-//
-//	cronjob "clowk-lp" "wal-cleanup" {
-//	  schedule = "0 2 * * *"
-//	  image    = "postgres:16"
-//	  command  = ["bash", "-c",
-//	    "find /wal-archive -mmin +10080 -delete"]  # 7 days
-//	  volumes  = ["voodu-clowk-lp-db-wal-archive-0:/wal-archive:rw"]
+//	wal_archive = {
+//	  enabled     = true                # default
+//	  strategy    = "local"             # default
+//	  destination = "/srv/pg-wal/db"    # override default path
 //	}
 //
-// (The volume name follows voodu's deterministic
-// voodu-<scope>-<name>-<claim>-<ordinal> convention; only ordinal
-// 0 archives in the single-primary M-P2 scope.)
+// # Cleanup / tiering
 //
-// Future M-P2.5 may add `retention_days = 7` to the block and
-// auto-emit the cronjob — deferred because operator cron pattern
-// already covers most setups and adds zero plugin code.
+// Plugin DOES NOT manage WAL retention or off-host replication. The
+// archive grows unbounded under default settings. Operator declares
+// cronjobs alongside the postgres resource for retention + sync to
+// S3/R2/etc. — see README "WAL archive to S3 + R2 (multi-cloud
+// durability)" for the canonical pattern.
 
 package main
 
@@ -62,31 +49,95 @@ import (
 
 // walArchiveSpec is the parsed view of the operator's
 // `wal_archive { ... }` block. nil means "block not declared" —
-// caller treats as "use defaults" (enabled, /wal-archive).
+// caller treats as "use defaults" (enabled, local strategy, default
+// destination per strategy).
 type walArchiveSpec struct {
 	// Enabled toggles the entire archive subsystem. When false:
 	//
-	//   - No second volume_claim emitted.
-	//   - No 00-wal-archive.conf file in the asset.
+	//   - No bind-mount / volume emitted (strategy-dependent).
+	//   - voodu-00-wal-archive.conf reduces to a comment header.
 	//   - postgres runs with default archive_mode (off).
 	//
-	// Default true (declared via the spec defaults; nil means
-	// "use defaults" which is enabled).
+	// Default true.
 	Enabled bool
 
-	// MountPath is the absolute path inside the container where
-	// the second volume_claim is mounted. archive_command writes
-	// here. Default /wal-archive.
-	MountPath string
+	// Strategy picks the destination shape. Today only "local" is
+	// implemented. Future: "s3", "r2", "nfs", "rsync". Each maps
+	// to a walArchiveStrategy via selectStrategy().
+	//
+	// Default "local".
+	Strategy string
+
+	// Destination is the strategy-interpreted target of the WAL
+	// archive. Concrete shape depends on Strategy:
+	//
+	//   - local:  absolute host path (/opt/voodu/backups/<scope>/<name>)
+	//   - s3:     "s3://bucket/prefix"     (future)
+	//   - r2:     "r2://bucket/prefix"     (future)
+	//   - nfs:    "nfs://server/export"    (future)
+	//   - rsync:  "user@host:/path"        (future)
+	//
+	// Empty means "use the strategy's default" — strategy.Apply()
+	// fills it in via DefaultDestination(scope, name).
+	Destination string
 }
 
-// walArchiveClaimName is the volume_claim name for the WAL
-// archive mount. Hyphenated to match docker volume naming
-// conventions (the controller composes
-// voodu-<scope>-<name>-<claim>-<ordinal>; underscores would
-// land in the docker volume name without issue, but hyphen is
-// the convention across the platform).
-const walArchiveClaimName = "wal-archive"
+// walArchivePlan is the strategy's contribution to the statefulset.
+// composeStatefulsetDefaults wires the volumes into the spec; the
+// archive_command lands in voodu-00-wal-archive.conf via
+// renderWALArchiveConf.
+type walArchivePlan struct {
+	// Volumes are the docker volume specs the strategy adds to
+	// every pod's `volumes` list. For "local": one host bind-mount
+	// at /wal-archive. For S3/R2 (future): empty (writes go via
+	// API/CLI, no mount needed).
+	Volumes []string
+
+	// ArchiveCommand is the literal string postgres runs to
+	// archive each WAL segment. Substitution placeholders %p
+	// (full path of segment) and %f (segment filename) are
+	// expanded by postgres at runtime.
+	ArchiveCommand string
+}
+
+// walArchiveStrategy is the contract every strategy implements.
+// Adding a new strategy = new file (strategy_<name>.go) + a case
+// in selectStrategy. No changes to wal_archive.go required.
+type walArchiveStrategy interface {
+	// Name returns the HCL identifier for this strategy
+	// ("local", "s3", etc.). Used in error messages.
+	Name() string
+
+	// DefaultDestination returns the destination when the
+	// operator omits `destination = "..."`. May return "" if
+	// the strategy has no sensible default (operator MUST then
+	// set destination explicitly — Validate rejects empty).
+	DefaultDestination(scope, name string) string
+
+	// Validate checks the operator-supplied destination + any
+	// strategy-specific fields. Called after parse, before
+	// composeStatefulsetDefaults. Empty Destination is allowed
+	// here when DefaultDestination is non-empty (Apply fills it).
+	Validate(spec *walArchiveSpec) error
+
+	// Apply renders the strategy's contribution to the
+	// statefulset spec. Receives the resolved destination
+	// (default already substituted when operator left it empty).
+	Apply(spec *walArchiveSpec, scope, name string) walArchivePlan
+}
+
+// selectStrategy returns the strategy impl for an HCL name.
+// Unknown names produce an error so an operator-typo'd value
+// fails loud at apply time instead of silently archiving
+// nothing.
+func selectStrategy(name string) (walArchiveStrategy, error) {
+	switch name {
+	case "", "local":
+		return localStrategy{}, nil
+	default:
+		return nil, fmt.Errorf("wal_archive.strategy %q unknown (supported: local)", name)
+	}
+}
 
 // walArchiveAssetKey is the asset file key + bind-mount path
 // for the plugin-side WAL archive config. The mount path is
@@ -96,27 +147,27 @@ const walArchiveClaimName = "wal-archive"
 // trump plugin defaults cleanly.
 const (
 	walArchiveAssetKey  = "wal_archive_conf"
-	walArchiveMountPath = "/etc/postgresql/voodu-00-wal-archive.conf"
+	walArchiveConfMountPath = "/etc/postgresql/voodu-00-wal-archive.conf"
 )
 
 // defaultWALArchiveSpec returns the spec used when the operator
-// omits the `wal_archive { }` block — i.e. archiving is on with
-// the local /wal-archive default.
+// omits the `wal_archive { }` block entirely — archiving is on,
+// local strategy, destination resolved from scope/name at apply.
 func defaultWALArchiveSpec() *walArchiveSpec {
 	return &walArchiveSpec{
-		Enabled:   true,
-		MountPath: "/wal-archive",
+		Enabled:  true,
+		Strategy: "local",
 	}
 }
 
 // parseWALArchiveSpec extracts the wal_archive sub-map from the
 // operator's spec. Returns nil if the block was not declared
-// (caller substitutes defaults).
+// (caller substitutes defaults via defaultWALArchiveSpec).
 //
-// HCL block decoding gives us a map[string]any with the
-// (single) bool/string body. Type errors surface here so apply
-// fails loudly instead of silently coercing — same posture as
-// parsePostgresSpec.
+// HCL block decoding gives us a map[string]any; the spec accepts
+// `wal_archive = { ... }` (assignment form) which decodes the
+// same way as a block. Type errors surface here so apply fails
+// loudly instead of silently coercing.
 func parseWALArchiveSpec(operatorSpec map[string]any) (*walArchiveSpec, error) {
 	v, present := operatorSpec["wal_archive"]
 	if !present {
@@ -139,32 +190,35 @@ func parseWALArchiveSpec(operatorSpec map[string]any) (*walArchiveSpec, error) {
 		out.Enabled = b
 	}
 
-	if rv, ok := body["mount_path"]; ok {
+	if rv, ok := body["strategy"]; ok {
 		s, ok := rv.(string)
 		if !ok {
-			return nil, fmt.Errorf("wal_archive.mount_path: expected string, got %T", rv)
+			return nil, fmt.Errorf("wal_archive.strategy: expected string, got %T", rv)
 		}
 
 		if s != "" {
-			out.MountPath = s
+			out.Strategy = s
 		}
+	}
+
+	if rv, ok := body["destination"]; ok {
+		s, ok := rv.(string)
+		if !ok {
+			return nil, fmt.Errorf("wal_archive.destination: expected string, got %T", rv)
+		}
+
+		// Empty string keeps default — caller (cmdExpand)
+		// resolves via strategy.DefaultDestination(scope, name).
+		out.Destination = s
 	}
 
 	return out, nil
 }
 
-// validateWALArchiveSpec catches misconfigurations at apply time
-// before any container spawns. Cheap, pure function — the cost
-// of a wrong path here is "postgres won't start, all data
-// inaccessible" so loud failure beats silent acceptance.
-//
-// Checks:
-//
-//  1. mount_path is non-empty when enabled.
-//  2. mount_path is absolute (starts with /).
-//  3. mount_path doesn't collide with PGDATA's mount root
-//     (/var/lib/postgresql/data) — that would shadow the data
-//     volume and corrupt the cluster.
+// validateWALArchiveSpec dispatches to the chosen strategy's
+// Validate. Strategy-agnostic checks (enabled toggle) live here;
+// strategy-specific checks (path absoluteness, dangerous roots,
+// URI schemes) live in each strategy_<name>.go.
 func validateWALArchiveSpec(spec *walArchiveSpec) error {
 	if spec == nil {
 		return nil
@@ -174,25 +228,12 @@ func validateWALArchiveSpec(spec *walArchiveSpec) error {
 		return nil
 	}
 
-	if spec.MountPath == "" {
-		return errors.New("wal_archive.mount_path is empty (must be an absolute path like /wal-archive)")
+	strategy, err := selectStrategy(spec.Strategy)
+	if err != nil {
+		return err
 	}
 
-	if !strings.HasPrefix(spec.MountPath, "/") {
-		return fmt.Errorf("wal_archive.mount_path %q is not absolute (must start with /)", spec.MountPath)
-	}
-
-	// Forbid colliding with the data mount. PGDATA root is
-	// /var/lib/postgresql/data; the wal_archive mounting
-	// anywhere under that would shadow data files at runtime.
-	const dataRoot = "/var/lib/postgresql/data"
-
-	if spec.MountPath == dataRoot ||
-		strings.HasPrefix(spec.MountPath, dataRoot+"/") {
-		return fmt.Errorf("wal_archive.mount_path %q overlaps PGDATA root %s (would shadow data files)", spec.MountPath, dataRoot)
-	}
-
-	return nil
+	return strategy.Validate(spec)
 }
 
 // renderWALArchiveConf produces the bytes the plugin emits as
@@ -205,16 +246,15 @@ func validateWALArchiveSpec(spec *walArchiveSpec) error {
 //
 //   - wal_level = replica  (required for archive + streaming)
 //   - archive_mode = on
-//   - archive_command = '<idempotent local cp>'
+//   - archive_command = <strategy-supplied>
 //   - archive_timeout = 60  (force a WAL switch every minute
 //     even when traffic is quiet — bounds the recovery RPO at
 //     ~1 minute on a low-write cluster)
 //
-// The string is single-quoted with the postgres-conf escape
+// archive_command is single-quoted with the postgres-conf escape
 // rule (doubled quote) to defend against operator-controlled
-// MountPath containing a quote character (validation above
-// doesn't reject that — pg-conf escape is enough).
-func renderWALArchiveConf(spec *walArchiveSpec) string {
+// destination strings containing a quote character.
+func renderWALArchiveConf(spec *walArchiveSpec, plan walArchivePlan) string {
 	if spec == nil || !spec.Enabled {
 		// Return the header alone so the asset still emits a
 		// file (the wrapper symlinks everything voodu-*.conf —
@@ -224,14 +264,11 @@ func renderWALArchiveConf(spec *walArchiveSpec) string {
 		return "# wal_archive disabled — no plugin-side overrides emitted\n"
 	}
 
-	mount := spec.MountPath
-	cmd := fmt.Sprintf("test ! -f %s/%%f && cp %%p %s/%%f", mount, mount)
-
 	// Render parameters in a stable alphabetical order — same
 	// reasoning as renderPgOverridesConf (asset digest
 	// stability across map iteration noise).
 	lines := map[string]string{
-		"archive_command": quotePgString(cmd),
+		"archive_command": quotePgString(plan.ArchiveCommand),
 		"archive_mode":    "on",
 		"archive_timeout": "60",
 		"wal_level":       "replica",
@@ -260,3 +297,9 @@ func renderWALArchiveConf(spec *walArchiveSpec) string {
 
 	return b.String()
 }
+
+// errEmptyDestination is the canonical error a strategy returns
+// when it has no DefaultDestination AND the operator left the
+// field blank. Stripped of strategy-specific noise so we can wrap
+// it consistently across strategies.
+var errEmptyDestination = errors.New("destination is required (no strategy default available)")

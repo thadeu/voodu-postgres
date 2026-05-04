@@ -92,29 +92,37 @@ func TestComposeInfoSnapshot_PrimaryOrdinalNonZero(t *testing.T) {
 	}
 }
 
-func TestComposeInfoSnapshot_WALArchiveDetected(t *testing.T) {
+func TestComposeInfoSnapshot_WALArchiveDetectedFromBindMount(t *testing.T) {
+	// Local strategy emits a `<destination>:/wal-archive:rw`
+	// bind-mount in `volumes`. Info snapshot detects it and
+	// surfaces the strategy + destination.
 	spec := map[string]any{
-		"volume_claims": []any{
-			map[string]any{"name": "data", "mount_path": "/var/lib/postgresql/data"},
-			map[string]any{"name": walArchiveClaimName, "mount_path": "/wal-archive"},
+		"volumes": []any{
+			"${asset.s.n.entrypoint}:/usr/local/bin/voodu-postgres-entrypoint:ro",
+			"/opt/voodu/backups/s/n:/wal-archive:rw",
 		},
 	}
 
 	snap := composeInfoSnapshot("s", "n", spec, map[string]string{})
 
 	if !snap.WALArchiveEnabled {
-		t.Error("wal_archive should be detected from volume_claim")
+		t.Error("wal_archive should be detected from bind-mount in volumes")
 	}
 
-	if snap.WALArchiveMountPath != "/wal-archive" {
-		t.Errorf("mount path: %q", snap.WALArchiveMountPath)
+	if snap.WALArchiveStrategy != "local" {
+		t.Errorf("strategy: got %q, want local", snap.WALArchiveStrategy)
+	}
+
+	if snap.WALArchiveDestination != "/opt/voodu/backups/s/n" {
+		t.Errorf("destination: %q", snap.WALArchiveDestination)
 	}
 }
 
 func TestComposeInfoSnapshot_WALArchiveDisabled(t *testing.T) {
 	spec := map[string]any{
-		"volume_claims": []any{
-			map[string]any{"name": "data", "mount_path": "/var/lib/postgresql/data"},
+		"volumes": []any{
+			"${asset.s.n.entrypoint}:/usr/local/bin/voodu-postgres-entrypoint:ro",
+			// no /wal-archive bind-mount
 		},
 	}
 
@@ -203,7 +211,8 @@ func TestFormatInfoText_IncludesCorePieces(t *testing.T) {
 		PasswordRedacted:            "abcd1234...",
 		ReplicationPasswordRedacted: "<unset>",
 		WALArchiveEnabled:           true,
-		WALArchiveMountPath:         "/wal-archive",
+		WALArchiveStrategy:          "local",
+		WALArchiveDestination:       "/opt/voodu/backups/clowk-lp/db",
 		Exposed:                     false,
 		BindAddress:                 "127.0.0.1 (loopback only)",
 		LinkedConsumers:             []string{"clowk-lp/web"},
@@ -222,7 +231,7 @@ func TestFormatInfoText_IncludesCorePieces(t *testing.T) {
 		"database        appdata",
 		"super_user      appuser",
 		"replication     replicator",
-		"wal_archive     enabled @ /wal-archive",
+		"wal_archive     enabled (local @ /opt/voodu/backups/clowk-lp/db)",
 		"linked consumers (1)",
 		"clowk-lp/web",
 	}

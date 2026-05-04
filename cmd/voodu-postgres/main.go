@@ -284,6 +284,21 @@ func cmdExpand() error {
 		walSpec = defaultWALArchiveSpec()
 	}
 
+	// Resolve the strategy + plan once. Plan is used by both
+	// renderWALArchiveConf (for archive_command) and
+	// composeStatefulsetDefaults (for volumes). Strategy was
+	// already validated by validatePostgresSpec above; this
+	// selectStrategy can't error.
+	walStrategy, err := selectStrategy(walSpec.Strategy)
+	if err != nil {
+		return fmt.Errorf("postgres %s: %w", refOrName(req.Scope, req.Name), err)
+	}
+
+	walPlan := walArchivePlan{}
+	if walSpec.Enabled {
+		walPlan = walStrategy.Apply(walSpec, req.Scope, req.Name)
+	}
+
 	// Primary ordinal: defaults to 0 (the convention is pod-0 =
 	// primary, pod-1+ = standbys). `vd postgres:promote --replica
 	// N` flips this via the PG_PRIMARY_ORDINAL bucket key — on the
@@ -300,7 +315,7 @@ func cmdExpand() error {
 
 	entrypointBytes := renderEntrypointScript()
 	overridesBytes := renderPgOverridesConf(spec.PgConfig)
-	walArchiveBytes := renderWALArchiveConf(walSpec)
+	walArchiveBytes := renderWALArchiveConf(walSpec, walPlan)
 	streamingBytes := renderStreamingConf(req.Scope, req.Name, primaryOrdinal, spec.ReplicationUser, replicationPassword)
 	initReplicationBytes := renderInitReplicationSH()
 
@@ -321,7 +336,7 @@ func cmdExpand() error {
 
 	exposed := req.Config[exposeFlagKey] == "true"
 
-	defaults := composeStatefulsetDefaults(req.Scope, req.Name, spec, password, replicationPassword, primaryOrdinal, walSpec, exposed)
+	defaults := composeStatefulsetDefaults(req.Scope, req.Name, spec, password, replicationPassword, primaryOrdinal, walPlan, exposed)
 	merged := mergeSpec(defaults, operatorSpec)
 
 	stripPluginOwnedFields(merged)
@@ -413,7 +428,7 @@ func assetRef(scope, name, key string) string {
 // Readiness probes after first boot completes (initdb takes a few
 // seconds on a fresh volume; the controller's start-grace covers
 // the gap).
-func composeStatefulsetDefaults(scope, name string, spec *postgresSpec, password, replicationPassword string, primaryOrdinal int, walSpec *walArchiveSpec, exposed bool) map[string]any {
+func composeStatefulsetDefaults(scope, name string, spec *postgresSpec, password, replicationPassword string, primaryOrdinal int, walPlan walArchivePlan, exposed bool) map[string]any {
 	env := map[string]any{
 		// Official postgres image contract
 		"POSTGRES_USER":        spec.User,
@@ -460,21 +475,21 @@ func composeStatefulsetDefaults(scope, name string, spec *postgresSpec, password
 		},
 	}
 
-	// WAL archive: when enabled, the statefulset gets a sibling
-	// volume_claim for the archive directory AND the asset file
-	// is loaded with directives. Disabled keeps the bind so the
-	// shape stays consistent across enable/disable flips, but
-	// skips the volume_claim — postgres runs without archive
-	// mode in that case.
+	// WAL archive: the asset bind for the .conf file is always
+	// emitted (header-only when disabled). When enabled, the
+	// strategy contributes its own volumes via walPlan:
+	//
+	//   - "local" strategy emits a host bind-mount at
+	//     /wal-archive (rw on every pod — see strategy_local.go
+	//     for the rationale on cluster-level WAL ownership).
+	//   - Future "s3"/"r2" strategies emit no volumes (writes
+	//     go via API/CLI without a mount).
 	volumes = append(volumes,
-		assetRef(scope, name, walArchiveAssetKey)+":"+walArchiveMountPath+":ro",
+		assetRef(scope, name, walArchiveAssetKey)+":"+walArchiveConfMountPath+":ro",
 	)
 
-	if walSpec != nil && walSpec.Enabled {
-		volumeClaims = append(volumeClaims, map[string]any{
-			"name":       walArchiveClaimName,
-			"mount_path": walSpec.MountPath,
-		})
+	for _, vol := range walPlan.Volumes {
+		volumes = append(volumes, vol)
 	}
 
 	// Port binding: loopback by default (voodu's "ports are
@@ -717,8 +732,9 @@ func defaultsForInspection() map[string]any {
 		"extensions":       []any{},
 		"replication_user": "replicator",
 		"wal_archive": map[string]any{
-			"enabled":    true,
-			"mount_path": "/wal-archive",
+			"enabled":     true,
+			"strategy":    "local",
+			"destination": "<auto: /opt/voodu/backups/<scope>/<name>>",
 		},
 	}
 }

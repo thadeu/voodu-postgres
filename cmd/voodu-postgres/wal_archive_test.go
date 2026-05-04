@@ -1,19 +1,20 @@
-// Tests for the wal_archive M-P2 surface: parser, validator, and
-// conf renderer. The (asset, statefulset) plumbing — adding the
-// 2nd volume_claim and 3rd asset bind — is covered in main_test.go
-// where the e2e expand flow lives.
+// Tests for the wal_archive surface: parser, validator, strategy
+// dispatch, and conf renderer. The (asset, statefulset) plumbing —
+// adding the asset bind + the strategy's volume contribution — is
+// covered in main_test.go where the e2e expand flow lives. Local-
+// strategy specifics (default destination, dangerous-path rejection,
+// archive_command shape) live in strategy_local_test.go.
 //
 // Pinning here:
 //
-//   - Default spec is enabled with /wal-archive mount.
-//   - Operator can opt out via `enabled = false` (no volume_claim
-//     emitted, asset file shipped header-only).
-//   - mount_path validation rejects relative paths and PGDATA
-//     overlaps (would shadow data files).
-//   - Conf renderer outputs alphabetically (asset digest stability).
-//   - archive_command is single-quoted with the postgres-conf
-//     escape rule (defends against operator-controlled mount paths
-//     with quotes).
+//   - Default spec is enabled with strategy = local.
+//   - Operator can opt out via `enabled = false`.
+//   - parseWALArchiveSpec maps `wal_archive = { ... }` cleanly.
+//   - validateWALArchiveSpec dispatches to the strategy's Validate.
+//   - selectStrategy returns localStrategy for "" and "local",
+//     errors for unknown values.
+//   - renderWALArchiveConf takes the strategy's plan and emits
+//     a deterministic, alphabetically-ordered conf body.
 
 package main
 
@@ -44,8 +45,9 @@ func TestParseWALArchiveSpec_AbsentBlockReturnsNil(t *testing.T) {
 }
 
 func TestParseWALArchiveSpec_EmptyBlockUsesDefaults(t *testing.T) {
-	// `wal_archive {}` — block declared but body empty. Defaults
-	// fill in (enabled, /wal-archive).
+	// `wal_archive = {}` — block declared but body empty.
+	// Defaults fill in (enabled, strategy=local, empty
+	// destination → caller substitutes default at expand).
 	got, err := parseWALArchiveSpec(map[string]any{
 		"wal_archive": map[string]any{},
 	})
@@ -62,16 +64,21 @@ func TestParseWALArchiveSpec_EmptyBlockUsesDefaults(t *testing.T) {
 		t.Error("default Enabled should be true")
 	}
 
-	if got.MountPath != "/wal-archive" {
-		t.Errorf("default MountPath: got %q, want /wal-archive", got.MountPath)
+	if got.Strategy != "local" {
+		t.Errorf("default Strategy: got %q, want local", got.Strategy)
+	}
+
+	if got.Destination != "" {
+		t.Errorf("default Destination should stay empty (caller substitutes), got %q", got.Destination)
 	}
 }
 
 func TestParseWALArchiveSpec_OperatorOverrides(t *testing.T) {
 	got, err := parseWALArchiveSpec(map[string]any{
 		"wal_archive": map[string]any{
-			"enabled":    false,
-			"mount_path": "/srv/pg/wal",
+			"enabled":     false,
+			"strategy":    "local",
+			"destination": "/srv/pg/wal",
 		},
 	})
 
@@ -83,36 +90,73 @@ func TestParseWALArchiveSpec_OperatorOverrides(t *testing.T) {
 		t.Error("expected Enabled=false from operator override")
 	}
 
-	if got.MountPath != "/srv/pg/wal" {
-		t.Errorf("MountPath: got %q", got.MountPath)
+	if got.Strategy != "local" {
+		t.Errorf("Strategy: got %q", got.Strategy)
+	}
+
+	if got.Destination != "/srv/pg/wal" {
+		t.Errorf("Destination: got %q", got.Destination)
 	}
 }
 
-func TestParseWALArchiveSpec_EmptyMountPathKeepsDefault(t *testing.T) {
-	// `mount_path = ""` means "revert override" — same posture
-	// as image/database empty in postgresSpec.
+func TestParseWALArchiveSpec_DestinationOverride(t *testing.T) {
 	got, err := parseWALArchiveSpec(map[string]any{
-		"wal_archive": map[string]any{"mount_path": ""},
+		"wal_archive": map[string]any{"destination": "/srv/custom/wal"},
 	})
 
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 
-	if got.MountPath != "/wal-archive" {
-		t.Errorf("empty mount_path should keep default, got %q", got.MountPath)
+	if got.Destination != "/srv/custom/wal" {
+		t.Errorf("Destination: got %q, want /srv/custom/wal", got.Destination)
+	}
+}
+
+func TestParseWALArchiveSpec_StrategyEmptyKeepsDefault(t *testing.T) {
+	// `strategy = ""` reverts to the default ("local") so an
+	// operator who wants to be explicit-but-default doesn't
+	// trigger the "unknown strategy" error.
+	got, err := parseWALArchiveSpec(map[string]any{
+		"wal_archive": map[string]any{"strategy": ""},
+	})
+
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	if got.Strategy != "local" {
+		t.Errorf("empty strategy should keep default, got %q", got.Strategy)
+	}
+}
+
+func TestParseWALArchiveSpec_DestinationEmptyKeepsForCallerToDefault(t *testing.T) {
+	// `destination = ""` leaves Destination empty so the caller
+	// (cmdExpand) substitutes strategy.DefaultDestination(scope, name)
+	// at expand time. Same posture as image/database empty.
+	got, err := parseWALArchiveSpec(map[string]any{
+		"wal_archive": map[string]any{"destination": ""},
+	})
+
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	if got.Destination != "" {
+		t.Errorf("empty destination should stay empty for caller-side default substitution, got %q", got.Destination)
 	}
 }
 
 func TestParseWALArchiveSpec_TypeErrors(t *testing.T) {
 	cases := []struct {
-		name  string
-		spec  any
-		want  string
+		name string
+		spec any
+		want string
 	}{
 		{"block-not-map", "string-instead-of-block", "wal_archive"},
 		{"enabled-not-bool", map[string]any{"enabled": "yes"}, "enabled"},
-		{"mount_path-not-string", map[string]any{"mount_path": 42}, "mount_path"},
+		{"strategy-not-string", map[string]any{"strategy": 42}, "strategy"},
+		{"destination-not-string", map[string]any{"destination": 42}, "destination"},
 	}
 
 	for _, tc := range cases {
@@ -132,6 +176,38 @@ func TestParseWALArchiveSpec_TypeErrors(t *testing.T) {
 	}
 }
 
+func TestSelectStrategy_LocalForEmptyAndExplicit(t *testing.T) {
+	// "" and "local" both resolve to localStrategy. "" lets the
+	// operator omit the field entirely without erroring.
+	for _, name := range []string{"", "local"} {
+		s, err := selectStrategy(name)
+		if err != nil {
+			t.Errorf("selectStrategy(%q): %v", name, err)
+			continue
+		}
+
+		if s.Name() != "local" {
+			t.Errorf("selectStrategy(%q).Name(): got %q, want local", name, s.Name())
+		}
+	}
+}
+
+func TestSelectStrategy_UnknownErrors(t *testing.T) {
+	cases := []string{"s3", "r2", "rsync", "nfs", "cloud", "FOOBAR"}
+
+	for _, name := range cases {
+		_, err := selectStrategy(name)
+		if err == nil {
+			t.Errorf("selectStrategy(%q) should error (not implemented yet)", name)
+			continue
+		}
+
+		if !strings.Contains(err.Error(), "unknown") {
+			t.Errorf("error should say 'unknown', got: %v", err)
+		}
+	}
+}
+
 func TestValidateWALArchiveSpec_NilOK(t *testing.T) {
 	// nil spec means "use defaults" — caller handles substitution.
 	if err := validateWALArchiveSpec(nil); err != nil {
@@ -140,75 +216,48 @@ func TestValidateWALArchiveSpec_NilOK(t *testing.T) {
 }
 
 func TestValidateWALArchiveSpec_DisabledSkipsChecks(t *testing.T) {
-	// When disabled, mount_path is irrelevant — validator skips
-	// the absoluteness/overlap checks.
-	bad := &walArchiveSpec{Enabled: false, MountPath: "not-absolute"}
+	// When disabled, destination is irrelevant — validator skips
+	// strategy dispatch entirely.
+	bad := &walArchiveSpec{Enabled: false, Strategy: "nonsense", Destination: "garbage"}
 	if err := validateWALArchiveSpec(bad); err != nil {
 		t.Errorf("disabled spec should skip checks: %v", err)
 	}
 }
 
-func TestValidateWALArchiveSpec_RejectsRelativePath(t *testing.T) {
-	cases := []string{
-		"wal-archive",
-		"./wal",
-		"../wal",
+func TestValidateWALArchiveSpec_UnknownStrategyRejected(t *testing.T) {
+	spec := &walArchiveSpec{Enabled: true, Strategy: "s3"}
+
+	err := validateWALArchiveSpec(spec)
+	if err == nil {
+		t.Fatal("expected error for unknown strategy")
 	}
 
-	for _, p := range cases {
-		spec := &walArchiveSpec{Enabled: true, MountPath: p}
-		if err := validateWALArchiveSpec(spec); err == nil {
-			t.Errorf("expected validation error for relative path %q", p)
-		}
+	if !strings.Contains(err.Error(), "unknown") {
+		t.Errorf("error should say 'unknown', got: %v", err)
 	}
 }
 
-func TestValidateWALArchiveSpec_RejectsEmptyPath(t *testing.T) {
-	spec := &walArchiveSpec{Enabled: true, MountPath: ""}
-	if err := validateWALArchiveSpec(spec); err == nil {
-		t.Error("expected validation error for empty mount_path")
-	}
-}
-
-func TestValidateWALArchiveSpec_RejectsPGDATAOverlap(t *testing.T) {
-	cases := []string{
-		"/var/lib/postgresql/data",
-		"/var/lib/postgresql/data/wal",
-		"/var/lib/postgresql/data/anywhere/under",
+func TestValidateWALArchiveSpec_DispatchesToLocalStrategy(t *testing.T) {
+	// Spec with explicit strategy="local" + dangerous destination →
+	// validator routes through localStrategy.Validate which rejects.
+	spec := &walArchiveSpec{
+		Enabled:     true,
+		Strategy:    "local",
+		Destination: "/etc/passwd",
 	}
 
-	for _, p := range cases {
-		spec := &walArchiveSpec{Enabled: true, MountPath: p}
-
-		err := validateWALArchiveSpec(spec)
-		if err == nil {
-			t.Errorf("expected error for PGDATA overlap %q", p)
-		}
-
-		if err != nil && !strings.Contains(err.Error(), "PGDATA") {
-			t.Errorf("error should mention PGDATA, got: %v", err)
-		}
-	}
-}
-
-func TestValidateWALArchiveSpec_AcceptsAbsoluteOutsidePGDATA(t *testing.T) {
-	cases := []string{
-		"/wal-archive",
-		"/srv/wal",
-		"/mnt/backup/wal",
-		"/var/lib/postgres-wal", // postgres-wal != postgresql/data
+	err := validateWALArchiveSpec(spec)
+	if err == nil {
+		t.Fatal("expected error for dangerous destination via local strategy")
 	}
 
-	for _, p := range cases {
-		spec := &walArchiveSpec{Enabled: true, MountPath: p}
-		if err := validateWALArchiveSpec(spec); err != nil {
-			t.Errorf("path %q should validate: %v", p, err)
-		}
+	if !strings.Contains(err.Error(), "destination") {
+		t.Errorf("error should mention 'destination', got: %v", err)
 	}
 }
 
 func TestRenderWALArchiveConf_DisabledReturnsHeaderOnly(t *testing.T) {
-	got := renderWALArchiveConf(&walArchiveSpec{Enabled: false})
+	got := renderWALArchiveConf(&walArchiveSpec{Enabled: false}, walArchivePlan{})
 
 	if !strings.Contains(got, "disabled") {
 		t.Errorf("disabled spec should comment why:\n%s", got)
@@ -226,14 +275,15 @@ func TestRenderWALArchiveConf_DisabledReturnsHeaderOnly(t *testing.T) {
 
 func TestRenderWALArchiveConf_NilSpecMatchesDisabled(t *testing.T) {
 	// Defensive — nil shouldn't panic, behaves like disabled.
-	got := renderWALArchiveConf(nil)
+	got := renderWALArchiveConf(nil, walArchivePlan{})
 	if !strings.Contains(got, "disabled") {
 		t.Errorf("nil should render as disabled:\n%s", got)
 	}
 }
 
 func TestRenderWALArchiveConf_EnabledEmitsRequiredDirectives(t *testing.T) {
-	got := renderWALArchiveConf(defaultWALArchiveSpec())
+	plan := localStrategy{}.Apply(defaultWALArchiveSpec(), "s", "n")
+	got := renderWALArchiveConf(defaultWALArchiveSpec(), plan)
 
 	wantLines := []string{
 		"wal_level = replica",
@@ -249,20 +299,23 @@ func TestRenderWALArchiveConf_EnabledEmitsRequiredDirectives(t *testing.T) {
 	}
 }
 
-func TestRenderWALArchiveConf_ArchiveCommandUsesMountPath(t *testing.T) {
-	got := renderWALArchiveConf(&walArchiveSpec{
-		Enabled:   true,
-		MountPath: "/srv/wal",
-	})
+func TestRenderWALArchiveConf_ArchiveCommandFromPlan(t *testing.T) {
+	// Strategy supplies the archive_command verbatim; renderer
+	// just quotes it. Pin this so a future strategy change in
+	// strategy_local.go flows through to the conf without a
+	// renderer edit.
+	plan := walArchivePlan{ArchiveCommand: "wal-g wal-push %p"}
+	got := renderWALArchiveConf(defaultWALArchiveSpec(), plan)
 
-	if !strings.Contains(got, "test ! -f /srv/wal/%f && cp %p /srv/wal/%f") {
-		t.Errorf("archive_command should interpolate mount_path:\n%s", got)
+	if !strings.Contains(got, "wal-g wal-push %p") {
+		t.Errorf("archive_command should be the plan's verbatim string:\n%s", got)
 	}
 }
 
 func TestRenderWALArchiveConf_AlphabeticalOrder(t *testing.T) {
 	// Stable bytes across re-applies → asset digest doesn't flap.
-	got := renderWALArchiveConf(defaultWALArchiveSpec())
+	plan := localStrategy{}.Apply(defaultWALArchiveSpec(), "s", "n")
+	got := renderWALArchiveConf(defaultWALArchiveSpec(), plan)
 
 	// archive_command should appear before archive_mode (alpha sort).
 	cmdIdx := strings.Index(got, "archive_command")
@@ -278,8 +331,9 @@ func TestRenderWALArchiveConf_AlphabeticalOrder(t *testing.T) {
 }
 
 func TestRenderWALArchiveConf_Deterministic(t *testing.T) {
-	a := renderWALArchiveConf(defaultWALArchiveSpec())
-	b := renderWALArchiveConf(defaultWALArchiveSpec())
+	plan := localStrategy{}.Apply(defaultWALArchiveSpec(), "s", "n")
+	a := renderWALArchiveConf(defaultWALArchiveSpec(), plan)
+	b := renderWALArchiveConf(defaultWALArchiveSpec(), plan)
 
 	if a != b {
 		t.Error("render is not deterministic across calls")

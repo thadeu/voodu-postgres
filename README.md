@@ -69,7 +69,7 @@ vd apply -f voodu.hcl
 Plugin emits:
 
 - **`asset "clowk-lp" "db"`** — 5 files: bash entrypoint wrapper, postgresql.conf overrides, WAL archive defaults, streaming-replication conf, replication-user init script
-- **`statefulset "clowk-lp" "db"`** — 3 pods (`db-0..db-2`), 2 volume claims (`data` + `wal-archive`), 5 asset bind-mounts, env vars wiring everything
+- **`statefulset "clowk-lp" "db"`** — 3 pods (`db-0..db-2`), 1 volume claim (`data`, per-pod) + 1 host bind-mount (`/opt/voodu/backups/clowk-lp/db` → `/wal-archive`, shared across pods), 5 asset bind-mounts, env vars wiring everything
 - **2 config_set actions** (first apply only) — persists auto-gen `POSTGRES_PASSWORD` + `POSTGRES_REPLICATION_PASSWORD`
 
 Wire your app:
@@ -117,9 +117,10 @@ postgres "scope" "name" {
   }
 
   # WAL archive (on by default — see WAL section)
-  wal_archive {
-    enabled    = true
-    mount_path = "/wal-archive"
+  wal_archive = {
+    enabled     = true
+    strategy    = "local"                              # default
+    destination = "/opt/voodu/backups/clowk-lp/db"     # default for local
   }
 
   # Extensions: parsed + validated, but NOT auto-installed (M-P4
@@ -145,7 +146,8 @@ Bare block — `postgres "data" "db" {}` — emits a statefulset with:
 - `replicas = 1` (single primary)
 - `command = ["bash", "/usr/local/bin/voodu-postgres-entrypoint"]` (role-aware wrapper)
 - `ports = ["5432"]` (loopback by default — `vd postgres:expose` to publish)
-- `volume_claims`: `data` at `/var/lib/postgresql/data` + `wal-archive` at `/wal-archive`
+- `volume_claims`: `data` at `/var/lib/postgresql/data` (per-pod, statefulset-style)
+- `volumes`: host bind-mount `/opt/voodu/backups/<scope>/<name>` → `/wal-archive` (shared across pods, see [WAL archive](#wal-archive))
 - `health_check = "pg_isready -U postgres -d postgres -p 5432"`
 - env: `POSTGRES_USER` / `POSTGRES_DB` / `POSTGRES_PASSWORD` / `POSTGRES_INITDB_ARGS` / `PGDATA` / `PG_PORT` / `PG_NAME` / `PG_SCOPE_SUFFIX` / `PG_PRIMARY_ORDINAL` / `PG_REPLICATION_USER` / `PG_REPLICATION_PASSWORD`
 
@@ -228,7 +230,7 @@ Extensions: enable inside the database via your app's migration system (Rails `e
 
 ### WAL archive
 
-WAL archive is on by default. Plugin emits a second `volume_claim` (`wal-archive` at `/wal-archive`) and a `voodu-00-wal-archive.conf` with:
+WAL archive is on by default. Plugin **bind-mounts a host directory** at `/wal-archive` inside every pod (NOT a per-pod volume_claim) and emits `voodu-00-wal-archive.conf` with:
 
 ```ini
 wal_level       = replica
@@ -250,15 +252,71 @@ postgres "clowk-lp" "db" {
 }
 ```
 
-Disable entirely (no second volume_claim, no archive overhead):
+Disable entirely (no host bind-mount, no archive overhead):
 
 ```hcl
 postgres "clowk-lp" "db" {
-  wal_archive {
+  wal_archive = {
     enabled = false
   }
 }
 ```
+
+#### Strategy + destination (single source of truth)
+
+The block has 3 fields:
+
+```hcl
+wal_archive = {
+  enabled     = true                                # default
+  strategy    = "local"                             # default — only one shipped today
+  destination = "/opt/voodu/backups/<scope>/<name>" # default for local
+}
+```
+
+| Field | What it does |
+|---|---|
+| `enabled` | toggle the whole subsystem |
+| `strategy` | picks how the WAL leaves the pod. Today: `"local"`. Future: `"s3"`, `"r2"`, `"nfs"`, `"rsync"` (each will live in `strategy_<name>.go`). |
+| `destination` | strategy-interpreted target. For `local`: an absolute host path. Future strategies use URI shapes (`s3://bucket/prefix`, etc.). |
+
+Why we picked this shape: `destination` is honest — it describes the WAL's destination regardless of medium. When S3/R2 ship later, the operator API stays identical (just flip `strategy`); no rename. The container mount path inside pods is fixed at `/wal-archive` for the local strategy — internal plumbing, not part of the operator surface.
+
+#### Local strategy — host bind-mount
+
+For `strategy = "local"` (default), plugin emits a bind-mount of `destination` (host path) → `/wal-archive` (container path) on EVERY pod, NOT a per-pod docker volume.
+
+Why bind-mount instead of `volume_claim`: WAL archive is **cluster-level state**, not pod-level. After a `vd pg:promote --replica 1` failover, pod-1 (new primary) needs to keep writing to the SAME archive directory pod-0 was writing to — otherwise PITR has a gap (old primary's WAL stranded on a different volume). Per-pod volumes orphan WAL on failover; a single host bind-mount preserves continuity.
+
+All pods (primary + standbys) mount `:rw`. In practice only the primary writes (postgres `archive_command` only fires on the primary), but the `:rw` mount means any standby promoted later continues writing transparently — no remount cycle.
+
+#### Pre-flight: create the host directory (local strategy only)
+
+Plugin does NOT create the directory automatically (would require privileged host access at apply time). Operator runs once before the first apply:
+
+```bash
+sudo mkdir -p /opt/voodu/backups/clowk-lp/db
+sudo chown 999:999 /opt/voodu/backups/clowk-lp/db    # postgres user UID/GID inside the container
+sudo chmod 0700 /opt/voodu/backups/clowk-lp/db       # WAL is sensitive — no world read
+```
+
+If the path is missing or has wrong ownership, postgres' `archive_command` fails per WAL switch (visible in `vd logs clowk-lp/db | grep archive`) and WAL accumulates in the data dir until disk is full.
+
+#### Custom `destination`
+
+Override when you want a different location (NFS mount, dedicated SSD, etc.):
+
+```hcl
+postgres "clowk-lp" "db" {
+  wal_archive = {
+    enabled     = true
+    strategy    = "local"
+    destination = "/mnt/nfs-backup/postgres/clowk-lp-db"
+  }
+}
+```
+
+The validator rejects `destination` under known dangerous roots (`/etc`, `/usr`, `/proc`, etc.) at apply time — operator typo doesn't bind-mount postgres on top of system files.
 
 **Cleanup is operator-owned** — see [Backup automation](#backup-automation) below.
 
@@ -349,11 +407,13 @@ postgres "clowk-lp" "db" {
 
 Produces 3 pods with stable identity:
 
-| Pod | Role | DNS | Volume claims |
+| Pod | Role | DNS | Per-pod data volume |
 |---|---|---|---|
-| `clowk-lp-db.0` | primary | `db-0.clowk-lp.voodu` | `voodu-clowk-lp-db-data-0`, `voodu-clowk-lp-db-wal-archive-0` |
-| `clowk-lp-db.1` | standby | `db-1.clowk-lp.voodu` | `voodu-clowk-lp-db-data-1`, `voodu-clowk-lp-db-wal-archive-1` |
-| `clowk-lp-db.2` | standby | `db-2.clowk-lp.voodu` | `voodu-clowk-lp-db-data-2`, `voodu-clowk-lp-db-wal-archive-2` |
+| `clowk-lp-db.0` | primary | `db-0.clowk-lp.voodu` | `voodu-clowk-lp-db-data-0` |
+| `clowk-lp-db.1` | standby | `db-1.clowk-lp.voodu` | `voodu-clowk-lp-db-data-1` |
+| `clowk-lp-db.2` | standby | `db-2.clowk-lp.voodu` | `voodu-clowk-lp-db-data-2` |
+
+WAL archive lives on a **shared host bind-mount** — `/opt/voodu/backups/clowk-lp/db` → `/wal-archive` on every pod. Primary writes via `archive_command`; standbys mount it `:rw` so a promoted-to-primary standby can keep writing without a re-mount. See [WAL archive](#wal-archive) for why this is shared and not per-pod.
 
 Plus the round-robin shared alias `db.clowk-lp.voodu` resolving to all 3 pods (use sparingly — primary writes need pod-0 specifically).
 
@@ -508,7 +568,7 @@ cronjob "clowk-lp" "wal-cleanup" {
   # 10080 minutes = 7 days
 
   volumes = [
-    "voodu-clowk-lp-db-wal-archive-0:/wal-archive:rw",
+    "/opt/voodu/backups/clowk-lp/db:/wal-archive:rw",
   ]
 }
 ```
@@ -579,7 +639,7 @@ cronjob "clowk-lp" "wal-sync-s3" {
   ]
 
   env_from = ["aws/cli"]
-  volumes  = ["voodu-clowk-lp-db-wal-archive-0:/wal-archive:ro"]
+  volumes  = ["/opt/voodu/backups/clowk-lp/db:/wal-archive:ro"]
 }
 
 # WAL → Cloudflare R2
@@ -594,7 +654,7 @@ cronjob "clowk-lp" "wal-sync-r2" {
   ]
 
   env_from = ["cloudflare/r2"]
-  volumes  = ["voodu-clowk-lp-db-wal-archive-0:/wal-archive:ro"]
+  volumes  = ["/opt/voodu/backups/clowk-lp/db:/wal-archive:ro"]
 }
 
 # Local cleanup (post-replication retention)
@@ -607,7 +667,7 @@ cronjob "clowk-lp" "wal-cleanup" {
     "find /wal-archive -type f -mmin +10080 -delete",  # 7 days local retention
   ]
 
-  volumes = ["voodu-clowk-lp-db-wal-archive-0:/wal-archive:rw"]
+  volumes = ["/opt/voodu/backups/clowk-lp/db:/wal-archive:rw"]
 }
 ```
 
@@ -694,7 +754,7 @@ cronjob "clowk-lp" "wal-rsync" {
        /wal-archive/ backup@storage.lan:/srv/pg-wal/clowk-lp/db/"]
 
   volumes = [
-    "voodu-clowk-lp-db-wal-archive-0:/wal-archive:ro",
+    "/opt/voodu/backups/clowk-lp/db:/wal-archive:ro",
     "/etc/voodu/secrets/ssh:/ssh:ro",       # SSH key bind-mounted from host
   ]
 }
@@ -716,25 +776,28 @@ cronjob "clowk-lp" "wal-restic" {
   env_from = ["restic/clowk"]    # RESTIC_REPOSITORY (s3:..., b2:..., sftp:...),
                                   # RESTIC_PASSWORD,
                                   # AWS_* if backend is S3
-  volumes = ["voodu-clowk-lp-db-wal-archive-0:/wal-archive:ro"]
+  volumes = ["/opt/voodu/backups/clowk-lp/db:/wal-archive:ro"]
 }
 ```
 
 #### NFS mount (no cronjob — direct postgres archive)
 
-If your `/wal-archive` mount IS the durable storage (NFS-backed docker volume, or bind-mount to a network filesystem), no sync cronjob needed. Postgres archives directly to the network share. Trade-off: if NFS goes slow or away, postgres' `archive_command` blocks the writer.
+If your `destination` IS the durable storage (NFS mount on the host, dedicated SSD, etc.), no sync cronjob needed. Postgres archives directly there. Trade-off: if NFS goes slow or away, postgres' `archive_command` blocks the writer.
 
 ```hcl
 postgres "clowk-lp" "db" {
   # ... rest of spec ...
 
-  wal_archive {
-    enabled    = true
-    mount_path = "/wal-archive"   # backed by NFS-mounted docker volume
-                                  # (configure docker volume driver outside voodu)
+  wal_archive = {
+    enabled     = true
+    strategy    = "local"
+    destination = "/mnt/nfs/postgres-wal/clowk-lp-db"  # NFS mount mounted
+                                                       # on the host outside voodu
   }
 }
 ```
+
+(A future `strategy = "nfs"` will manage the NFS mount itself — for now you handle that via systemd or fstab and point `destination` at the local mountpoint.)
 
 #### Trade-off summary
 
@@ -1096,14 +1159,29 @@ The plugin ships pre-built linux/amd64 + linux/arm64 binaries via GitHub Release
 
 ## Storage
 
-Per-pod volumes follow voodu's deterministic naming:
+The plugin uses two storage shapes:
+
+### Per-pod data (statefulset semantics)
+
+Each pod gets its own `data` volume — postgres' authoritative data directory. Pod restarts re-attach to the same volume; scale-down preserves it; `vd delete --prune` is the only thing that destroys it.
 
 | Claim | Volume name (ordinal 0) | Mount path | Survives |
 |---|---|---|---|
 | `data` | `voodu-<scope>-<name>-data-0` | `/var/lib/postgresql/data` | pod restart, scale-down |
-| `wal-archive` | `voodu-<scope>-<name>-wal-archive-0` | `/wal-archive` | pod restart, scale-down |
 
-Standbys (ordinal 1+) get their own per-pod data + wal-archive volumes. Scale-down preserves volumes — operator opts into destruction via `vd delete --prune`.
+Standbys (ordinal 1+) get their own per-pod `data` volume (`voodu-<scope>-<name>-data-1`, `-2`, …). Each pod is independent — losing one pod's data volume forces a re-bootstrap from the primary via `pg_basebackup`, but the others stay healthy.
+
+### Shared WAL archive (strategy-driven)
+
+WAL archive is **cluster-level** state, not pod-level. The `wal_archive { strategy = ... }` block picks how WAL leaves the pod. Today only `local` ships (bind-mount of a host directory at `/wal-archive`); future strategies (`s3`, `r2`, `nfs`, `rsync`) plug in via the same interface.
+
+For `strategy = "local"` (default):
+
+| Source | Container path | Mount mode | Default destination |
+|---|---|---|---|
+| host bind-mount | `/wal-archive` | `:rw` (all pods) | `/opt/voodu/backups/<scope>/<name>` |
+
+Override the host path with `wal_archive = { destination = "..." }`. Operator must `mkdir -p` and `chown 999:999` the destination before `vd apply` (postgres uid/gid inside the container is 999). See [WAL archive](#wal-archive) for the full setup.
 
 ## License
 

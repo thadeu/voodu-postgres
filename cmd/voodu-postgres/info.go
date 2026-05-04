@@ -130,8 +130,9 @@ type infoSnapshot struct {
 	ReplicationUser string   `json:"replication_user"`
 	PasswordRedacted        string   `json:"password_redacted"`
 	ReplicationPasswordRedacted string `json:"replication_password_redacted"`
-	WALArchiveEnabled bool   `json:"wal_archive_enabled"`
-	WALArchiveMountPath string `json:"wal_archive_mount_path,omitempty"`
+	WALArchiveEnabled     bool   `json:"wal_archive_enabled"`
+	WALArchiveStrategy    string `json:"wal_archive_strategy,omitempty"`
+	WALArchiveDestination string `json:"wal_archive_destination,omitempty"`
 	Exposed         bool     `json:"exposed"`
 	BindAddress     string   `json:"bind_address"`
 	LinkedConsumers []string `json:"linked_consumers,omitempty"`
@@ -189,24 +190,41 @@ func composeInfoSnapshot(scope, name string, spec map[string]any, config map[str
 		snap.StandbyFQDNs = append(snap.StandbyFQDNs, composePrimaryFQDN(scope, name, i))
 	}
 
-	// WAL archive detection: look for the wal-archive
-	// volume_claim. Plugin always emits the asset bind, but the
-	// claim only appears when wal_archive { enabled = true }
-	// (the default).
-	if claims, ok := spec["volume_claims"].([]any); ok {
-		for _, c := range claims {
-			m, ok := c.(map[string]any)
-			if !ok {
+	// WAL archive detection: scan volumes for a bind-mount
+	// whose container target is "/wal-archive". Plugin always
+	// emits the asset bind for the .conf file; the EXTRA
+	// host-path bind only appears when wal_archive enabled +
+	// strategy = "local".
+	//
+	// Asset binds start with "${asset...}:"; host bind-mounts
+	// start with a plain absolute path "/...". When we find the
+	// host bind, the strategy is local and the host path is the
+	// destination.
+	//
+	// FUTURE: when s3/r2 strategies ship, detection branches on
+	// config bucket markers (e.g. PG_WAL_STRATEGY=s3 written by
+	// the plugin) instead of pure volume scan.
+	if vols, ok := spec["volumes"].([]any); ok {
+		for _, v := range vols {
+			s, ok := v.(string)
+			if !ok || !strings.HasPrefix(s, "/") {
 				continue
 			}
 
-			if m["name"] == walArchiveClaimName {
-				snap.WALArchiveEnabled = true
-				if mp, ok := m["mount_path"].(string); ok {
-					snap.WALArchiveMountPath = mp
-				}
-				break
+			parts := strings.SplitN(s, ":", 3)
+			if len(parts) < 2 {
+				continue
 			}
+
+			hostPath, containerPath := parts[0], parts[1]
+			if containerPath != "/wal-archive" {
+				continue
+			}
+
+			snap.WALArchiveEnabled = true
+			snap.WALArchiveStrategy = "local"
+			snap.WALArchiveDestination = hostPath
+			break
 		}
 	}
 
@@ -278,7 +296,7 @@ func formatInfoText(s infoSnapshot) string {
 
 	walState := "disabled"
 	if s.WALArchiveEnabled {
-		walState = "enabled @ " + s.WALArchiveMountPath
+		walState = fmt.Sprintf("enabled (%s @ %s)", s.WALArchiveStrategy, s.WALArchiveDestination)
 	}
 
 	b.WriteString(fmt.Sprintf("  wal_archive     %s\n", walState))
