@@ -88,13 +88,43 @@ type postgresSpec struct {
 	// type tricks. Values stringified as-is.
 	PgConfig map[string]any
 
-	// Extensions is a list of extension names auto-installed via
-	// `CREATE EXTENSION IF NOT EXISTS <name>` on first primary
-	// boot AND on each subsequent boot (idempotent). Empty/nil
-	// means operator manages extensions via app migrations
-	// (Rails: `enable_extension :pgvector`). Both paths coexist.
-	// Each name validated as postgres identifier.
+	// Extensions is a list of extension names that the operator
+	// declares the cluster needs. Validated as postgres identifiers
+	// at apply time (anti-injection guard).
+	//
+	// IN M-P1: parsed and validated, NOT auto-installed at runtime.
+	// Operators install via app migrations (Rails:
+	// `enable_extension :pgvector`) or manually via psql.
+	//
+	// In M-P4: `vd postgres:exec "CREATE EXTENSION ..."` ships,
+	// and this field becomes the source of truth for an
+	// `extensions:install` subcommand the operator runs explicitly.
+	// Auto-install on every boot was rejected because it conflicts
+	// with the typical Rails/Django flow (the migration is the
+	// source of truth) and timing the run inside the wrapper
+	// requires a two-phase boot (postgres up → psql → restart) that
+	// adds startup latency for no operator benefit.
 	Extensions []string
+
+	// WALArchive carries the operator's `wal_archive { ... }`
+	// block. nil means the operator omitted the block entirely;
+	// the caller substitutes defaultWALArchiveSpec() (enabled,
+	// /wal-archive). M-P2 introduces this — see wal_archive.go
+	// for the parser, validator, and conf renderer.
+	WALArchive *walArchiveSpec
+
+	// ReplicationUser is the postgres ROLE used for streaming
+	// replication. Default "replicator". Distinct from the
+	// superuser (User field) by security best practice — the
+	// replicator role only carries the REPLICATION attribute,
+	// not full DDL/DML powers, so a leaked replication password
+	// can't drop your tables.
+	//
+	// The matching password is auto-generated and never
+	// surfaced in HCL — it lives in the config bucket
+	// (POSTGRES_REPLICATION_PASSWORD), generated on first
+	// apply. See replication.go for the lifecycle.
+	ReplicationUser string
 }
 
 // parsePostgresSpec extracts the plugin-owned fields from the
@@ -106,14 +136,15 @@ type postgresSpec struct {
 // so apply fails loudly instead of silently coercing to garbage.
 func parsePostgresSpec(operatorSpec map[string]any) (*postgresSpec, error) {
 	spec := &postgresSpec{
-		Image:          defaultImage,
-		Replicas:       1,
-		Database:       "postgres",
-		User:           "postgres",
-		Password:       "",
-		Port:           5432,
-		InitdbLocale:   "C.UTF-8",
-		InitdbEncoding: "UTF8",
+		Image:           defaultImage,
+		Replicas:        1,
+		Database:        "postgres",
+		User:            "postgres",
+		Password:        "",
+		Port:            5432,
+		InitdbLocale:    "C.UTF-8",
+		InitdbEncoding:  "UTF8",
+		ReplicationUser: "replicator",
 	}
 
 	if v, present := operatorSpec["image"]; present {
@@ -229,6 +260,24 @@ func parsePostgresSpec(operatorSpec map[string]any) (*postgresSpec, error) {
 		spec.Extensions = out
 	}
 
+	if v, present := operatorSpec["replication_user"]; present {
+		s, ok := v.(string)
+		if !ok {
+			return nil, fmt.Errorf("replication_user: expected string, got %T", v)
+		}
+
+		if s != "" {
+			spec.ReplicationUser = s
+		}
+	}
+
+	wal, err := parseWALArchiveSpec(operatorSpec)
+	if err != nil {
+		return nil, err
+	}
+
+	spec.WALArchive = wal
+
 	return spec, nil
 }
 
@@ -263,6 +312,14 @@ func validatePostgresSpec(spec *postgresSpec) error {
 		return fmt.Errorf("user %q is not a valid postgres identifier (must be 1-63 chars, start with letter or underscore, contain only letters/digits/underscores)", spec.User)
 	}
 
+	if !isValidPostgresIdentifier(spec.ReplicationUser) {
+		return fmt.Errorf("replication_user %q is not a valid postgres identifier (must be 1-63 chars, start with letter or underscore, contain only letters/digits/underscores)", spec.ReplicationUser)
+	}
+
+	if spec.ReplicationUser == spec.User {
+		return fmt.Errorf("replication_user must differ from user (%q) — separate roles is a security best practice; the replicator role should only carry REPLICATION, not full superuser powers", spec.User)
+	}
+
 	if spec.Port < 1 || spec.Port > 65535 {
 		return fmt.Errorf("port = %d not allowed (must be 1..65535)", spec.Port)
 	}
@@ -277,6 +334,10 @@ func validatePostgresSpec(spec *postgresSpec) error {
 		if !isValidPgConfigKey(key) {
 			return fmt.Errorf("pg_config key %q is not a valid postgres parameter name (must match [a-z][a-z0-9_]*; anti-injection guard)", key)
 		}
+	}
+
+	if err := validateWALArchiveSpec(spec.WALArchive); err != nil {
+		return err
 	}
 
 	return nil
@@ -389,21 +450,28 @@ func refOrName(scope, name string) string {
 // stripPluginOwnedFields removes the keys parsePostgresSpec
 // consumed from the operator's raw spec map, so they don't leak
 // into the downstream statefulset wire shape. Statefulset doesn't
-// know what `database`, `user`, `password`, `pg_config`, etc. mean
-// — they're plugin concepts.
+// know what `database`, `user`, `password`, `port`, `pg_config`,
+// etc. mean — they're plugin concepts.
+//
+// `port` IS stripped because composeStatefulsetDefaults has
+// already translated it into the statefulset's `ports` list (the
+// real statefulset wire shape). Leaving `port` in the merged map
+// would expose a plugin field on the statefulset spec that the
+// controller doesn't recognise.
 //
 // `image` and `replicas` STAY in the merged spec — they're real
-// statefulset fields and the controller needs them. `port` also
-// stays because it maps to the statefulset's `ports` shape (M-P1
-// will translate `port = 5432` into the statefulset port entry).
+// statefulset fields and the controller needs them.
 func stripPluginOwnedFields(merged map[string]any) {
 	delete(merged, "database")
 	delete(merged, "user")
 	delete(merged, "password")
+	delete(merged, "port")
 	delete(merged, "initdb_locale")
 	delete(merged, "initdb_encoding")
 	delete(merged, "pg_config")
 	delete(merged, "extensions")
+	delete(merged, "wal_archive")
+	delete(merged, "replication_user")
 }
 
 // looksLikePostgresIdentifier is a softer check used in error

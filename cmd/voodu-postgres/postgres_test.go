@@ -183,6 +183,72 @@ func TestParsePostgresSpec_EmptyStringKeepsDefault(t *testing.T) {
 	}
 }
 
+func TestParsePostgresSpec_ReplicationUserDefault(t *testing.T) {
+	spec, err := parsePostgresSpec(nil)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	if spec.ReplicationUser != "replicator" {
+		t.Errorf("default replication_user: got %q, want replicator", spec.ReplicationUser)
+	}
+}
+
+func TestParsePostgresSpec_ReplicationUserOverride(t *testing.T) {
+	spec, err := parsePostgresSpec(map[string]any{
+		"replication_user": "repluser",
+	})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	if spec.ReplicationUser != "repluser" {
+		t.Errorf("override lost: got %q", spec.ReplicationUser)
+	}
+}
+
+func TestParsePostgresSpec_ReplicationUserEmptyKeepsDefault(t *testing.T) {
+	spec, err := parsePostgresSpec(map[string]any{
+		"replication_user": "",
+	})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	if spec.ReplicationUser != "replicator" {
+		t.Errorf("empty replication_user should keep default, got %q", spec.ReplicationUser)
+	}
+}
+
+func TestValidatePostgresSpec_ReplicationUserMustDifferFromUser(t *testing.T) {
+	// Security best practice: separate roles. Same name on both
+	// would mean the replicator role is the superuser, defeating
+	// the principle of least privilege.
+	spec, _ := parsePostgresSpec(map[string]any{
+		"user":             "myapp",
+		"replication_user": "myapp",
+	})
+
+	err := validatePostgresSpec(spec)
+	if err == nil {
+		t.Fatal("expected validation error when replication_user equals user")
+	}
+
+	if !strings.Contains(err.Error(), "replication_user must differ") {
+		t.Errorf("error should explain conflict, got: %v", err)
+	}
+}
+
+func TestValidatePostgresSpec_ReplicationUserBadIdentifier(t *testing.T) {
+	spec, _ := parsePostgresSpec(map[string]any{
+		"replication_user": "bad-name",
+	})
+
+	if err := validatePostgresSpec(spec); err == nil {
+		t.Error("expected validation error for hyphenated replication_user")
+	}
+}
+
 func TestParsePostgresSpec_PasswordEmptyMeansAutoGen(t *testing.T) {
 	// `password = ""` is the documented way to revert override
 	// and let the plugin auto-gen at boot. Spec field stays empty;
@@ -637,18 +703,21 @@ func TestStripPluginOwnedFields(t *testing.T) {
 		"env":      map[string]any{"FOO": "bar"},
 
 		// plugin-owned (stripped)
-		"database":        "appdata",
-		"user":            "appuser",
-		"password":        "s3cret",
-		"initdb_locale":   "C.UTF-8",
-		"initdb_encoding": "UTF8",
-		"pg_config":       map[string]any{"max_connections": 200},
-		"extensions":      []any{"pgvector"},
+		"database":         "appdata",
+		"user":             "appuser",
+		"password":         "s3cret",
+		"port":             5433,
+		"initdb_locale":    "C.UTF-8",
+		"initdb_encoding":  "UTF8",
+		"pg_config":        map[string]any{"max_connections": 200},
+		"extensions":       []any{"pgvector"},
+		"wal_archive":      map[string]any{"enabled": true},
+		"replication_user": "replicator",
 	}
 
 	stripPluginOwnedFields(merged)
 
-	stripped := []string{"database", "user", "password", "initdb_locale", "initdb_encoding", "pg_config", "extensions"}
+	stripped := []string{"database", "user", "password", "port", "initdb_locale", "initdb_encoding", "pg_config", "extensions", "wal_archive", "replication_user"}
 
 	for _, k := range stripped {
 		if _, present := merged[k]; present {

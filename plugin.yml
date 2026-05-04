@@ -1,16 +1,50 @@
 name: postgres
-version: 0.3.0-dev
+version: 0.4.0
 description: >
-  Voodu plugin for postgres clusters. Status: M-P0 (HCL parse +
-  validations, runtime emission stubbed). Production-ready
-  primary + standbys + WAL archive + failover + backup/restore
-  ship incrementally in M-P1..M-P6 — track v0.3.x for first
-  production release.
+  Voodu plugin for postgres clusters. Single primary + N standbys
+  via streaming replication, WAL archive (local default,
+  S3/R2-overridable), auto-gen passwords, link/unlink for
+  DATABASE_URL injection, expose/unexpose for internet-facing
+  bind. Failover + backup/restore land in M-P5/M-P6.
 homepage: https://github.com/thadeu/voodu-postgres
 
 commands:
   - name: expand
     help: >
-      Macro entrypoint invoked by the controller during apply.
-      M-P0: parses + validates HCL, then returns a hard error
-      pointing at M-P1 for runtime emission.
+      (Internal.) Macro entrypoint invoked by the controller
+      during apply. Emits the (asset, statefulset) pair plus
+      auto-gen state actions (POSTGRES_PASSWORD,
+      POSTGRES_REPLICATION_PASSWORD on first apply).
+
+  - name: link
+    help: >
+      Wire DATABASE_URL into a consumer.
+      Usage: vd postgres:link <provider-scope/name> <consumer-scope/name> [--reads]
+      Emits DATABASE_URL (always) + DATABASE_READ_URL (--reads with
+      replicas > 1, multi-host libpq URL spanning standbys).
+
+  - name: unlink
+    help: >
+      Remove a previously-set DATABASE_URL.
+      Usage: vd postgres:unlink <provider-scope/name> <consumer-scope/name>
+
+  - name: new-password
+    help: >
+      Rotate the superuser password.
+      Usage: vd postgres:new-password <postgres-scope/name> [--no-restart]
+      Auto-refreshes DATABASE_URL on every linked consumer.
+
+  - name: info
+    help: >
+      Show cluster topology + bucket vars.
+      Usage: vd postgres:info <postgres-scope/name> [-o json]
+
+  - name: expose
+    help: >
+      Publish postgres on 0.0.0.0:<port> (internet-facing).
+      Usage: vd postgres:expose <postgres-scope/name>
+
+  - name: unexpose
+    help: >
+      Return postgres to 127.0.0.1:<port> (loopback only).
+      Usage: vd postgres:unexpose <postgres-scope/name>

@@ -46,7 +46,8 @@ install-local: build
 	fi
 	@mkdir -p $(PLUGINS_ROOT)/postgres/bin
 	cp $(BIN) $(PLUGINS_ROOT)/postgres/bin/voodu-postgres
-	cp bin/expand $(PLUGINS_ROOT)/postgres/bin/
+	cp bin/expand bin/link bin/unlink bin/new-password bin/info bin/expose bin/unexpose bin/help \
+	   $(PLUGINS_ROOT)/postgres/bin/
 	chmod +x $(PLUGINS_ROOT)/postgres/bin/*
 	cp plugin.yml $(PLUGINS_ROOT)/postgres/
 	cp install uninstall $(PLUGINS_ROOT)/postgres/ 2>/dev/null || true
