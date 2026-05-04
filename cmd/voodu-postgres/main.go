@@ -114,7 +114,7 @@ type expandedPayload struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		emitErr("usage: voodu-postgres <expand|link|unlink|new-password|info|expose|unexpose|failover|rejoin|psql|backup|restore|defaults|help|--version>")
+		emitErr("usage: voodu-postgres <expand|link|unlink|new-password|info|expose|unexpose|promote|rejoin|psql|backup|restore|defaults|help|--version>")
 		os.Exit(1)
 	}
 
@@ -167,8 +167,13 @@ func main() {
 			os.Exit(1)
 		}
 
-	case "failover":
-		if err := cmdFailover(); err != nil {
+	case "promote", "failover":
+		// "promote" is the canonical name (M-P5+); "failover"
+		// is the legacy alias kept for backward compat with any
+		// scripts that already use vd pg:failover. Both invoke
+		// the same handler — plugin owns the pg_promote() SQL,
+		// operator never types it.
+		if err := cmdPromote(); err != nil {
 			emitErr(err.Error())
 			os.Exit(1)
 		}
@@ -208,7 +213,7 @@ func main() {
 		printPluginOverview()
 
 	default:
-		emitErr(fmt.Sprintf("unknown subcommand %q (want expand|link|unlink|new-password|info|expose|unexpose|failover|rejoin|psql|backup|restore|defaults|help)", os.Args[1]))
+		emitErr(fmt.Sprintf("unknown subcommand %q (want expand|link|unlink|new-password|info|expose|unexpose|promote|rejoin|psql|backup|restore|defaults|help)", os.Args[1]))
 		os.Exit(1)
 	}
 }
@@ -279,12 +284,19 @@ func cmdExpand() error {
 		walSpec = defaultWALArchiveSpec()
 	}
 
-	// Primary ordinal: M-P3 hard-codes 0 (the convention is
-	// pod-0 = primary, pod-1+ = standbys). M-P5 will let
-	// `vd postgres:failover --replica N` flip this via
-	// config bucket, at which point the wrapper picks it up
-	// from PG_PRIMARY_ORDINAL on next boot.
+	// Primary ordinal: defaults to 0 (the convention is pod-0 =
+	// primary, pod-1+ = standbys). `vd postgres:promote --replica
+	// N` flips this via the PG_PRIMARY_ORDINAL bucket key — on the
+	// next expand the wrapper picks the new value up from req.Config
+	// and standbys reconnect to the new primary FQDN.
 	primaryOrdinal := 0
+	if config := req.Config; config != nil {
+		if v, ok := config[primaryOrdinalKey]; ok && v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+				primaryOrdinal = n
+			}
+		}
+	}
 
 	entrypointBytes := renderEntrypointScript()
 	overridesBytes := renderPgOverridesConf(spec.PgConfig)

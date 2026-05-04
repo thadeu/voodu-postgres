@@ -1,6 +1,6 @@
 name: postgres
 aliases: [pg]
-version: 0.5.0
+version: 0.6.0
 description: >
   Voodu plugin for postgres clusters. Single primary + N standbys
   via streaming replication, WAL archive (local default,
@@ -52,12 +52,19 @@ commands:
       Return postgres to 127.0.0.1:<port> (loopback only).
       Usage: vd postgres:unexpose <postgres-scope/name>
 
+  - name: promote
+    help: >
+      Promote a standby to primary. Plugin owns the SQL —
+      runs lag check (pg_stat_replication) and pg_promote()
+      internally; operator never types SQL. Refuses if any
+      standby is behind unless --force.
+      Usage: vd postgres:promote <postgres-scope/name> --replica <N> [--force] [--no-restart]
+
   - name: failover
     help: >
-      Promote a standby to primary by flipping the cluster's
-      primary ordinal. Operator runs pg_promote() on the target
-      standby BEFORE this command.
-      Usage: vd postgres:failover <postgres-scope/name> --replica <N> [--no-restart]
+      Legacy alias for `promote`. Same handler; kept for
+      backward compat with scripts using vd pg:failover.
+      Usage: vd postgres:failover <postgres-scope/name> --replica <N> [--force] [--no-restart]
 
   - name: rejoin
     help: >

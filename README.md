@@ -18,7 +18,7 @@ Bare block produces a single hardened primary; `replicas = 3` flips it into a cl
   - [Cluster shape](#cluster-shape)
   - [Cold-start sequence](#cold-start-sequence)
   - [Write vs read endpoints](#write-vs-read-endpoints)
-  - [Manual failover](#manual-failover)
+  - [Promote a standby](#promote-a-standby)
   - [Rejoining the old primary](#rejoining-the-old-primary)
 - [Backup automation](#backup-automation)
   - [`vd postgres:backup`](#vd-postgresbackup)
@@ -398,33 +398,36 @@ Standby retry: if primary isn't ready (race during first cluster apply), the wra
 
 Without `--reads`, only `DATABASE_URL` is emitted (single primary endpoint). Apps without read-replica logic just use that.
 
-### Manual failover
+### Promote a standby
 
-`vd postgres:failover` flips the cluster's primary ordinal. Workflow is **3 explicit steps** — the plugin doesn't auto-promote because that's destructive of the old primary's writability.
+`vd postgres:promote` is a 2-step manual failover. Plugin owns ALL the postgres-side SQL — operator never types it:
 
 ```bash
-# Step 1: PROMOTE — operator runs pg_promote() on the target standby.
-#         Verify replication lag FIRST (or you may lose writes):
-vd postgres:psql clowk-lp/db --replica 0 \
-  -c "SELECT pid, application_name, state, sync_state, replay_lsn
-      FROM pg_stat_replication;"
+# Step 1: PROMOTE — plugin runs lag check + pg_promote() + flips
+#         PG_PRIMARY_ORDINAL + refreshes DATABASE_URL on every
+#         linked consumer + rolling restart.
+vd postgres:promote clowk-lp/db --replica 1
 
-vd postgres:psql clowk-lp/db --replica 1 -c "SELECT pg_promote();"
-
-# Step 2: FAILOVER — flip PG_PRIMARY_ORDINAL + refresh DATABASE_URL on
-#         every linked consumer + trigger rolling restart so all pods
-#         re-read streaming.conf with the new primary FQDN.
-vd postgres:failover clowk-lp/db --replica 1
-
-# Step 3: REJOIN — recover the OLD primary as a standby of the new one.
-#         Required because the rolling restart will hit pod-0 with
+# Step 2: REJOIN — recover the OLD primary as a standby of the new one.
+#         Required because the rolling restart hits pod-0 with
 #         PG_PRIMARY_ORDINAL=1 but PGDATA still in primary state — the
 #         wrapper's split-brain guard catches it and refuses to start.
 vd postgres:rejoin clowk-lp/db --replica 0
 ```
 
+What `promote` does internally:
+
+1. **Lag check** — queries `pg_stat_replication` on the current primary. Refuses if any standby is behind (`max_lag_bytes > 0`) unless `--force` is passed.
+2. **pg_promote** — runs `SELECT pg_promote(true, 60)` inside the target container. Postgres exits recovery mode and becomes the new primary.
+3. **Wait** — polls `pg_is_in_recovery()` until it returns `false` (max 30s).
+4. **Bucket flip** — sets `PG_PRIMARY_ORDINAL=N` so the next expand re-renders `streaming.conf` with the new primary FQDN.
+5. **Refresh consumers** — every linked consumer's `DATABASE_URL[/_READ_URL]` is rewritten to point at the new primary; rolling restart picks up the change.
+
 Flags:
-- `--no-restart` on `failover` — flip the bucket + URLs but skip the rolling restart. Useful for staged failovers (verify, then restart on demand).
+- `--force` — promote despite replication lag (operator accepts data loss). Required when the current primary is unreachable (lag check itself would error).
+- `--no-restart` — flip the bucket + URLs but skip the rolling restart on the postgres pods. Useful for staged promotions (verify, then restart on demand).
+
+Legacy alias: `vd postgres:failover` still works (same handler), kept for backward-compat with scripts using the old name.
 
 ### Rejoining the old primary
 
@@ -731,7 +734,7 @@ vd postgres:unexpose clowk-lp/db
 | `vd postgres:info <postgres> [-o json]` | Cluster topology snapshot (text or JSON) |
 | `vd postgres:expose <postgres>` | Publish on 0.0.0.0:`<port>` (Internet-facing) |
 | `vd postgres:unexpose <postgres>` | Return to 127.0.0.1:`<port>` (loopback only) |
-| `vd postgres:failover <postgres> --replica <N> [--no-restart]` | Promote a standby to primary (operator runs `pg_promote()` first) |
+| `vd postgres:promote <postgres> --replica <N> [--force] [--no-restart]` | Promote a standby to primary (plugin runs `pg_promote()` internally; refuses on lag without `--force`) |
 | `vd postgres:rejoin <postgres> --replica <N>` | Re-attach a divergent pod as standby via `pg_rewind` |
 | `vd postgres:psql <postgres> [--replica N] [-c "<sql>"]` | Drop into psql against the cluster (no password needed) |
 | `vd postgres:backup <postgres> --destination <path> [--from-replica N]` | `pg_basebackup` snapshot to a tar file |
