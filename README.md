@@ -26,6 +26,7 @@ Bare block produces a single hardened primary; `replicas = 3` flips it into a cl
   - [WAL cleanup pattern](#wal-cleanup-pattern)
   - [Scheduled basebackups](#scheduled-basebackups)
   - [Off-site WAL replication (S3 + R2 double durability)](#off-site-wal-replication-s3--r2-double-durability)
+  - [Alternative archive destinations](#alternative-archive-destinations)
 - [Disaster recovery](#disaster-recovery)
   - [Restore from cloud archive](#restore-from-cloud-archive)
   - [Recovery scenarios](#recovery-scenarios)
@@ -672,6 +673,79 @@ For long-term retention beyond the 7-day local window, configure lifecycle polic
 ```
 
 **Cloudflare R2** — Dashboard → bucket → Settings → Lifecycle. R2 has a single tier (no Glacier equivalent), so policy is just `Delete after N days`. 90/180-day expiration is typical.
+
+### Alternative archive destinations
+
+The cronjob pattern is destination-agnostic — `aws s3 sync` is just one tool that happens to mount the WAL archive volume. Any container that can read `/wal-archive` and ship the bytes elsewhere works the same way. Some common alternatives:
+
+#### rsync to a backup VM (LAN, no egress cost)
+
+Useful when you have a bastion / NAS / dedicated backup host on the same private network. Zero cloud bills, but durability is bounded by your single backup host.
+
+```hcl
+cronjob "clowk-lp" "wal-rsync" {
+  schedule = "*/15 * * * *"
+  image    = "alpine"
+
+  command = ["sh", "-c",
+    "apk add --no-cache rsync openssh-client && \
+     rsync -avz \
+       -e 'ssh -i /ssh/id_ed25519 -o StrictHostKeyChecking=no' \
+       /wal-archive/ backup@storage.lan:/srv/pg-wal/clowk-lp/db/"]
+
+  volumes = [
+    "voodu-clowk-lp-db-wal-archive-0:/wal-archive:ro",
+    "/etc/voodu/secrets/ssh:/ssh:ro",       # SSH key bind-mounted from host
+  ]
+}
+```
+
+#### restic — deduped + encrypted backups
+
+`restic` deduplicates at the chunk level and encrypts client-side. Storage cost drops sharply for WAL (lots of incremental similarity), and the repo is opaque to whoever holds the bucket — even with stolen S3 credentials, no readable data without the password.
+
+```hcl
+cronjob "clowk-lp" "wal-restic" {
+  schedule = "0 */4 * * *"             # every 4 hours
+  image    = "restic/restic:latest"
+
+  command = ["backup", "/wal-archive",
+             "--tag", "wal",
+             "--host", "clowk-lp-db"]
+
+  env_from = ["restic/clowk"]    # RESTIC_REPOSITORY (s3:..., b2:..., sftp:...),
+                                  # RESTIC_PASSWORD,
+                                  # AWS_* if backend is S3
+  volumes = ["voodu-clowk-lp-db-wal-archive-0:/wal-archive:ro"]
+}
+```
+
+#### NFS mount (no cronjob — direct postgres archive)
+
+If your `/wal-archive` mount IS the durable storage (NFS-backed docker volume, or bind-mount to a network filesystem), no sync cronjob needed. Postgres archives directly to the network share. Trade-off: if NFS goes slow or away, postgres' `archive_command` blocks the writer.
+
+```hcl
+postgres "clowk-lp" "db" {
+  # ... rest of spec ...
+
+  wal_archive {
+    enabled    = true
+    mount_path = "/wal-archive"   # backed by NFS-mounted docker volume
+                                  # (configure docker volume driver outside voodu)
+  }
+}
+```
+
+#### Trade-off summary
+
+| Destination | Egress cost | Durability | Setup effort | Best for |
+|---|---|---|---|---|
+| **S3 + R2** (recommended) | Low (storage cents) | Multi-region, multi-cloud | Low (creds + lifecycle) | Production, geo-redundant |
+| **rsync to backup VM** | Zero (LAN) | Single host (one disk) | Medium (SSH keys, host OS) | Dev / homelab, fast LAN |
+| **restic** (any backend) | Low | Encrypted + deduped | Medium (repo init, password mgmt) | Long-retention, sensitive data |
+| **NFS direct mount** | N/A | Inherited from NAS | Low (docker volume driver) | When NAS is the source of truth |
+
+You can mix: S3 for off-site disaster recovery + rsync to the LAN NAS for fast local restore + a daily restic snapshot for compliance. Each is just one more cronjob.
 
 ---
 
