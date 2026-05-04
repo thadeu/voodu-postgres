@@ -1,11 +1,14 @@
 name: postgres
+aliases: [pg]
 version: 0.4.0
 description: >
   Voodu plugin for postgres clusters. Single primary + N standbys
   via streaming replication, WAL archive (local default,
   S3/R2-overridable), auto-gen passwords, link/unlink for
   DATABASE_URL injection, expose/unexpose for internet-facing
-  bind. Failover + backup/restore land in M-P5/M-P6.
+  bind, manual failover/rejoin, psql shortcut, backup/restore
+  with PITR. Heroku-style `vd pg:<cmd>` shortcut works alongside
+  the canonical `vd postgres:<cmd>`.
 homepage: https://github.com/thadeu/voodu-postgres
 
 commands:
