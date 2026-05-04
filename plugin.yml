@@ -1,13 +1,16 @@
 name: postgres
-version: 0.2.1
+version: 0.3.0-dev
 description: >
-  Voodu macro plugin that expands postgres { ... } HCL blocks into
-  statefulset manifests.
+  Voodu plugin for postgres clusters. Status: M-P0 (HCL parse +
+  validations, runtime emission stubbed). Production-ready
+  primary + standbys + WAL archive + failover + backup/restore
+  ship incrementally in M-P1..M-P6 — track v0.3.x for first
+  production release.
 homepage: https://github.com/thadeu/voodu-postgres
 
 commands:
   - name: expand
     help: >
       Macro entrypoint invoked by the controller during apply.
-      Reads an expand request from stdin and emits a statefulset
-      manifest envelope on stdout.
+      M-P0: parses + validates HCL, then returns a hard error
+      pointing at M-P1 for runtime emission.

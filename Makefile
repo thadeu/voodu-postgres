@@ -1,9 +1,10 @@
 # voodu-postgres — Makefile
 #
 # Build targets produce the `voodu-postgres` binary under bin/, which
-# is the real plugin command. The shell wrappers (bin/create,
-# bin/destroy) exec it with the right subcommand — that's how the
-# Voodu plugin loader discovers each command by name.
+# is the real plugin command. The shell wrappers (bin/expand and the
+# plugin commands added in later milestones) exec it with the right
+# subcommand — that's how the Voodu plugin loader discovers each
+# command by name.
 
 BIN      := bin/voodu-postgres
 PKG      := ./cmd/voodu-postgres
@@ -45,7 +46,7 @@ install-local: build
 	fi
 	@mkdir -p $(PLUGINS_ROOT)/postgres/bin
 	cp $(BIN) $(PLUGINS_ROOT)/postgres/bin/voodu-postgres
-	cp bin/create bin/destroy $(PLUGINS_ROOT)/postgres/bin/
+	cp bin/expand $(PLUGINS_ROOT)/postgres/bin/
 	chmod +x $(PLUGINS_ROOT)/postgres/bin/*
 	cp plugin.yml $(PLUGINS_ROOT)/postgres/
 	cp install uninstall $(PLUGINS_ROOT)/postgres/ 2>/dev/null || true

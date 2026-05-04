@@ -1,30 +1,31 @@
 // Command voodu-postgres expands a `postgres "<scope>" "<name>" { … }`
-// HCL block into a statefulset manifest. The macro is an ALIAS of
-// statefulset with sensible defaults: every statefulset attribute
-// the operator declares wins; the plugin only fills in what's
-// missing.
+// HCL block into a statefulset manifest.
 //
-// Custom postgres.conf / pg_hba.conf are supplied via the `asset`
-// kind separately and referenced in `volumes` — the plugin
-// doesn't carry knobs for them. Same posture as every other
-// macro plugin: dumb alias, smart asset kind.
+// # Status: M-P0 (stub)
+//
+// This release parses + validates the operator's HCL and STOPS — no
+// runtime manifest is emitted yet. Apply will fail loudly with a
+// "not yet implemented" message that points at the next milestone.
+//
+// The full production-ready plugin (initdb, postgresql.conf
+// bootstrap, streaming replication, WAL archive, failover,
+// backup/restore) lands incrementally in M-P1..M-P6. See
+// project_voodu_postgres_planning.md for the milestone breakdown.
 //
 // # Plugin contract
 //
 // stdin: { kind, scope, name, spec } — same shape voodu's
 // controller persists for any kind.
 //
-// stdout: envelope with data = a statefulset Manifest. The
-// operator's spec is treated as overrides on top of the
-// defaults below.
+// stdout (M-P0): error envelope when expand is called against a
+// real apply, OK envelope when `defaults` is called for inspection.
 //
-// # Defaults the plugin contributes
+// # Defaults (target shape, emitted by `defaults` subcommand)
 //
-//	image       = "postgres:15"
+//	image       = "postgres:latest"
 //	replicas    = 1
-//	env         = { POSTGRES_DB = <name>, PGDATA = "/var/lib/postgresql/data/pgdata" }
-//	ports       = ["5432"]
-//	volume_claim "data" { mount_path = "/var/lib/postgresql/data" }
+//	database    = "postgres"
+//	user        = "postgres"
 package main
 
 import (
@@ -36,7 +37,7 @@ import (
 
 var version = "dev"
 
-const defaultImage = "postgres:15"
+const defaultImage = "postgres:latest"
 
 type expandRequest struct {
 	Kind  string          `json:"kind"`
@@ -51,13 +52,6 @@ type envelope struct {
 	Error  string `json:"error,omitempty"`
 }
 
-type statefulset struct {
-	Kind  string         `json:"kind"`
-	Scope string         `json:"scope,omitempty"`
-	Name  string         `json:"name"`
-	Spec  map[string]any `json:"spec"`
-}
-
 func main() {
 	if len(os.Args) < 2 {
 		emitErr("usage: voodu-postgres <expand|defaults|--version>")
@@ -69,7 +63,7 @@ func main() {
 		fmt.Println(version)
 
 	case "defaults":
-		emitOK(composeDefaults("<name>"))
+		emitOK(composeDefaults())
 
 	case "expand":
 		if err := cmdExpand(); err != nil {
@@ -83,6 +77,15 @@ func main() {
 	}
 }
 
+// cmdExpand is the M-P0 stub. It still parses + validates the
+// operator's HCL block (so misconfigurations surface at apply
+// time) but deliberately refuses to emit a runtime manifest —
+// that lands in M-P1.
+//
+// Returning a hard error here is intentional: it stops `vd apply`
+// from proceeding and prints a clear pointer at the milestone
+// that wires up actual statefulset emission. Same pattern voodu-
+// redis used during M-S0 of its Sentinel rollout.
 func cmdExpand() error {
 	raw, err := io.ReadAll(os.Stdin)
 	if err != nil {
@@ -106,89 +109,46 @@ func cmdExpand() error {
 		}
 	}
 
-	merged := mergeSpec(composeDefaults(req.Name), operatorSpec)
+	spec, err := parsePostgresSpec(operatorSpec)
+	if err != nil {
+		return fmt.Errorf("postgres %s: %w", refOrName(req.Scope, req.Name), err)
+	}
 
-	emitOK(statefulset{
-		Kind:  "statefulset",
-		Scope: req.Scope,
-		Name:  req.Name,
-		Spec:  merged,
-	})
+	if err := validatePostgresSpec(spec); err != nil {
+		return fmt.Errorf("postgres %s: %w", refOrName(req.Scope, req.Name), err)
+	}
 
-	return nil
+	return fmt.Errorf(
+		"postgres %s: HCL parsed and validated (image=%s, replicas=%d, database=%s, user=%s, port=%d, extensions=%d, pg_config_keys=%d), "+
+			"but runtime emission is not yet implemented (lands in M-P1 of voodu-postgres). "+
+			"Track plugin v0.3.x for the first production-ready release.",
+		refOrName(req.Scope, req.Name),
+		spec.Image,
+		spec.Replicas,
+		spec.Database,
+		spec.User,
+		spec.Port,
+		len(spec.Extensions),
+		len(spec.PgConfig),
+	)
 }
 
-// composeDefaults is the single source of truth for what the
-// plugin contributes when the operator omits a field.
-//
-// PGDATA points at a subdirectory of the volume mount because
-// postgres rejects starting in a non-empty mountpoint that
-// wasn't initialised by initdb (some volume drivers carry a
-// `lost+found` directory at the root).
-func composeDefaults(name string) map[string]any {
+// composeDefaults returns the target default shape the plugin
+// will emit once M-P1 lands. In M-P0 it's only used by the
+// `defaults` subcommand for inspection — it does NOT feed expand.
+func composeDefaults() map[string]any {
 	return map[string]any{
-		"image":    defaultImage,
-		"replicas": 1,
-		"env": map[string]any{
-			"POSTGRES_DB": name,
-			"PGDATA":      "/var/lib/postgresql/data/pgdata",
-		},
-		"ports": []any{"5432"},
-		"volume_claims": []any{
-			map[string]any{
-				"name":       "data",
-				"mount_path": "/var/lib/postgresql/data",
-			},
-		},
+		"image":           defaultImage,
+		"replicas":        1,
+		"database":        "postgres",
+		"user":            "postgres",
+		"password":        "<auto-generated 32 chars on first boot>",
+		"port":            5432,
+		"initdb_locale":   "C.UTF-8",
+		"initdb_encoding": "UTF8",
+		"pg_config":       map[string]any{},
+		"extensions":      []any{},
 	}
-}
-
-// mergeSpec applies operator overrides on top of plugin
-// defaults. Shallow merge — operator wins outright per key —
-// except for `env`, which deep-merges so operator-added
-// secrets don't wipe POSTGRES_DB / PGDATA defaults.
-//
-// Empty-but-present operator values (e.g. `volume_claims = []`)
-// are honoured verbatim: it's how operators opt out of a
-// default.
-func mergeSpec(defaults, operator map[string]any) map[string]any {
-	out := make(map[string]any, len(defaults))
-
-	for k, v := range defaults {
-		out[k] = v
-	}
-
-	for k, v := range operator {
-		if k == "env" {
-			out[k] = mergeEnv(out[k], v)
-			continue
-		}
-
-		out[k] = v
-	}
-
-	return out
-}
-
-func mergeEnv(defaultEnv, operatorEnv any) any {
-	a, _ := defaultEnv.(map[string]any)
-	b, _ := operatorEnv.(map[string]any)
-
-	if len(a) == 0 && len(b) == 0 {
-		return nil
-	}
-
-	out := make(map[string]any, len(a)+len(b))
-
-	for k, v := range a {
-		out[k] = v
-	}
-
-	for k, v := range b {
-		out[k] = v
-	}
-
-	return out
 }
 
 func emitOK(data any) {
