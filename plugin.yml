@@ -1,6 +1,6 @@
 name: postgres
 aliases: [pg]
-version: 0.4.0
+version: 0.5.0
 description: >
   Voodu plugin for postgres clusters. Single primary + N standbys
   via streaming replication, WAL archive (local default,
