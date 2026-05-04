@@ -1,0 +1,84 @@
+# AWS S3
+# vd config aws/cli set AWS_ACCESS_KEY_ID=AKIA...
+# vd config aws/cli set AWS_SECRET_ACCESS_KEY=<aws-secret>
+# vd config aws/cli set AWS_DEFAULT_REGION=us-east-1
+
+# Cloudflare R2 (S3-compatible API)
+# vd config cloudflare/r2 set AWS_ACCESS_KEY_ID=<r2-access-key>
+# vd config cloudflare/r2 set AWS_SECRET_ACCESS_KEY=<r2-secret-key>
+# vd config cloudflare/r2 set AWS_DEFAULT_REGION=auto
+# vd config cloudflare/r2 set AWS_ENDPOINT_URL=https://<account>.r2.cloudflarestorage.com
+
+# Check archive list
+# docker exec clowk-lp-db.0 ls -lh /wal-archive | head
+
+# logs from S3 sync cronjob
+# vd logs cronjob clowk-lp/wal-sync-s3
+# → "upload: ./000... to s3://..." (ou "" se --only-show-errors e nenhum erro)
+
+# logs from R2 sync cronjob
+# vd logs cronjob clowk-lp/wal-sync-r2
+
+postgres "clowk-lp" "db" {
+  image    = "postgres:16"
+  replicas = 3
+  database = "clowk_development"
+
+  wal_archive {
+    enabled    = true
+    mount_path = "/wal-archive"
+  }
+
+  resources {
+    limits {
+      cpu    = "0.5"
+      memory = "1Gi"
+    }
+  }
+
+  pg_config = {
+    max_connections = 50
+    shared_buffers  = "256MB"
+    work_mem        = "16MB"
+  }
+}
+
+cronjob "clowk-lp" "wal-sync-s3" {
+  image = "amazon/aws-cli:latest"
+  env_from = ["aws/cli"]
+  schedule = "*/15 * * * *" # every 15 min
+
+  command = [
+    "s3", "sync", "/pg-archive/", "s3://<your-aws-bucket>/pg-wal/",
+    "--no-progress",
+    "--only-show-errors",
+  ]
+
+  volumes  = ["voodu-clowk-lp-db-wal-archive-0:/pg-archive:ro"]
+}
+
+cronjob "clowk-lp" "wal-sync-r2" {
+  image    = "amazon/aws-cli:latest"
+  schedule = "5-59/15 * * * *" # every 15 min, offset +5 from S3
+  env_from = ["cloudflare/r2"]
+
+  command = [
+    "s3", "sync", "/wal-archive/", "s3://<your-r2-bucket>/postgres-wal/",
+    "--no-progress",
+    "--only-show-errors",
+  ]
+
+  volumes  = ["voodu-clowk-lp-db-wal-archive-0:/wal-archive:ro"]
+}
+
+cronjob "clowk-lp" "wal-cleanup" {
+  schedule = "0 6 * * *" # daily 06:00
+  image    = "alpine"
+
+  command = [
+    "sh", "-c",
+    "find /wal-archive -type f -mmin +10080 -delete",  # 7 days
+  ]
+
+  volumes = ["voodu-clowk-lp-db-wal-archive-0:/wal-archive:rw"]
+}

@@ -24,13 +24,17 @@ Bare block produces a single hardened primary; `replicas = 3` flips it into a cl
   - [`vd postgres:backup`](#vd-postgresbackup)
   - [`vd postgres:restore`](#vd-postgresrestore)
   - [WAL cleanup pattern](#wal-cleanup-pattern)
-  - [Scheduled backups](#scheduled-backups)
+  - [Scheduled basebackups](#scheduled-basebackups)
+  - [Off-site WAL replication (S3 + R2 double durability)](#off-site-wal-replication-s3--r2-double-durability)
+- [Disaster recovery](#disaster-recovery)
+  - [Restore from cloud archive](#restore-from-cloud-archive)
+  - [Recovery scenarios](#recovery-scenarios)
 - [Connecting via `psql`](#connecting-via-psql)
 - [Real-world examples](#real-world-examples)
   - [Single primary + Rails app](#single-primary--rails-app)
   - [3-replica cluster + Rails MultiDB](#3-replica-cluster--rails-multidb)
   - [Custom image with pgvector](#custom-image-with-pgvector)
-  - [WAL archive to S3](#wal-archive-to-s3)
+  - [WAL archive to S3 + R2 (multi-cloud durability)](#wal-archive-to-s3--r2-multi-cloud-durability)
   - [External access for DBeaver / TablePlus](#external-access-for-dbeaver--tableplus)
 - [Plugin reference](#plugin-reference)
   - [Commands](#commands)
@@ -510,22 +514,226 @@ cronjob "clowk-lp" "wal-cleanup" {
 
 For S3/R2 archives (operator-overridden `archive_command`), no cleanup cronjob needed — set bucket lifecycle policy on the cloud side.
 
-### Scheduled backups
+### Scheduled basebackups
 
-Wrap `vd postgres:backup` in a voodu cronjob:
+Wrap `vd postgres:backup` in a voodu cronjob — produces a daily `pg_basebackup` tar (snapshot of full cluster state):
 
 ```hcl
-cronjob "clowk-lp" "db-backup" {
-  schedule = "0 3 * * *"               # daily at 03:00
-  image    = "ghcr.io/clowk/voodu-cli:latest"   # has vd binary
+cronjob "clowk-lp" "db-basebackup" {
+  schedule = "0 3 * * *"                          # daily at 03:00
+  image    = "ghcr.io/clowk/voodu-cli:latest"     # has vd binary
 
-  command = ["bash", "-c", "vd postgres:backup clowk-lp/db --destination /backup/db-$(date +%Y%m%d).tar --from-replica 1"]
+  command = ["bash", "-c",
+    "vd postgres:backup clowk-lp/db --destination /backup/db-$(date +%Y%m%d).tar --from-replica 1"]
 
   volumes = ["/srv/pg-backups:/backup:rw"]
 }
 ```
 
-S3/R2 upload — pipe through awscli or rclone in the cronjob command, or use a separate sync cronjob.
+`--from-replica 1` offloads the snapshot work to a standby (no write contention on primary). Tar lives on the host's `/srv/pg-backups`. Pair this with the WAL replication below for full point-in-time recovery coverage.
+
+### Off-site WAL replication (S3 + R2 double durability)
+
+WAL replication to multiple clouds gives you point-in-time recovery (PITR) even after a total host loss. Architecture:
+
+```
+postgres archive_command writes LOCAL (/wal-archive)
+       ↓
+       ├── cronjob A: sync /wal-archive → AWS S3   (every 15 min)
+       ├── cronjob B: sync /wal-archive → CF R2    (every 15 min, +5 offset)
+       └── cronjob C: cleanup local > 7 days       (daily)
+```
+
+Postgres keeps WAL local for 7 days; both S3 and R2 mirror it asynchronously. After the retention window, local cleanup runs — durability survives via the cloud copies. Bucket lifecycle policies on the cloud side handle long-term retention.
+
+#### One-time setup — credential buckets
+
+Use voodu's [shared config bucket pattern](#bucket-keys-config) to inject AWS-format env vars into the sync cronjobs. Cloudflare R2 is S3-compatible, so the same `awscli` image talks to both — only the endpoint URL differs.
+
+```bash
+# AWS S3
+vd config aws/cli set AWS_ACCESS_KEY_ID=AKIA...
+vd config aws/cli set AWS_SECRET_ACCESS_KEY=<aws-secret>
+vd config aws/cli set AWS_DEFAULT_REGION=us-east-1
+
+# Cloudflare R2 (S3-compatible API — same env var names, different endpoint)
+vd config cloudflare/r2 set AWS_ACCESS_KEY_ID=<r2-access-key>
+vd config cloudflare/r2 set AWS_SECRET_ACCESS_KEY=<r2-secret-key>
+vd config cloudflare/r2 set AWS_DEFAULT_REGION=auto
+vd config cloudflare/r2 set AWS_ENDPOINT_URL=https://<account-id>.r2.cloudflarestorage.com
+```
+
+#### Cronjobs (HCL)
+
+```hcl
+# WAL → AWS S3
+cronjob "clowk-lp" "wal-sync-s3" {
+  schedule = "*/15 * * * *"             # every 15 min, on the quarter
+  image    = "amazon/aws-cli:latest"
+
+  command = [
+    "s3", "sync", "/wal-archive/", "s3://<your-aws-bucket>/postgres-wal/",
+    "--no-progress",
+    "--only-show-errors",
+  ]
+
+  env_from = ["aws/cli"]
+  volumes  = ["voodu-clowk-lp-db-wal-archive-0:/wal-archive:ro"]
+}
+
+# WAL → Cloudflare R2
+cronjob "clowk-lp" "wal-sync-r2" {
+  schedule = "5-59/15 * * * *"          # every 15 min, offset +5 from S3
+  image    = "amazon/aws-cli:latest"
+
+  command = [
+    "s3", "sync", "/wal-archive/", "s3://<your-r2-bucket>/postgres-wal/",
+    "--no-progress",
+    "--only-show-errors",
+  ]
+
+  env_from = ["cloudflare/r2"]
+  volumes  = ["voodu-clowk-lp-db-wal-archive-0:/wal-archive:ro"]
+}
+
+# Local cleanup (post-replication retention)
+cronjob "clowk-lp" "wal-cleanup" {
+  schedule = "0 6 * * *"                # daily 06:00
+  image    = "alpine"
+
+  command = [
+    "sh", "-c",
+    "find /wal-archive -type f -mmin +10080 -delete",  # 7 days local retention
+  ]
+
+  volumes = ["voodu-clowk-lp-db-wal-archive-0:/wal-archive:rw"]
+}
+```
+
+Apply alongside the postgres resource:
+
+```bash
+vd apply -f voodu.hcl
+```
+
+#### Design rationale
+
+| Decision | Why |
+|---|---|
+| Sync cronjobs (not inline `archive_command`) | Inline would block postgres on every WAL flush; failure in any cloud stalls the writer. Async sync decouples — postgres writes locally fast, replication catches up |
+| `:ro` mount on sync cronjobs | Sync only reads. Defensive against awscli bugs that might write back |
+| `*/15` + `5-59/15` offset | Stagger S3 and R2 by 5 min; avoids dual `aws s3 sync` competing for IO on the same volume |
+| `--only-show-errors` | Without it, `aws s3 sync` logs every upload — daily logs balloon. Errors still surface |
+| `amazon/aws-cli:latest` for both | R2 speaks S3 API; same binary works for both clouds |
+| `cloudflare/r2` bucket reuses `AWS_*` env names | awscli reads `AWS_ENDPOINT_URL` natively (v2.13+) — no env var translation needed |
+| 7-day local retention | Buffer against extended cloud outage; cleanup cronjob trims after that |
+
+#### Verifying
+
+```bash
+# Postgres pod-0 archiving locally?
+docker exec clowk-lp-db.0 ls -lh /wal-archive | head
+# → 16MB hex-named files (00000001000000000000000A, etc.)
+
+# S3 sync ran?
+vd logs cronjob clowk-lp/wal-sync-s3
+# → Empty (success, --only-show-errors) or "upload: ..." lines
+
+# R2 sync ran?
+vd logs cronjob clowk-lp/wal-sync-r2
+
+# Confirm WALs landed in S3
+aws s3 ls s3://<your-aws-bucket>/postgres-wal/ | tail
+
+# Confirm WALs landed in R2
+aws s3 ls s3://<your-r2-bucket>/postgres-wal/ \
+  --endpoint-url https://<account-id>.r2.cloudflarestorage.com | tail
+```
+
+#### Cloud-side bucket lifecycle (operator-side, fora do voodu)
+
+For long-term retention beyond the 7-day local window, configure lifecycle policies on the cloud console:
+
+**AWS S3** — JSON lifecycle rule (via Console or `aws s3api put-bucket-lifecycle-configuration`):
+
+```json
+{
+  "Rules": [{
+    "Id": "wal-archive-tiering",
+    "Status": "Enabled",
+    "Filter": { "Prefix": "postgres-wal/" },
+    "Transitions": [
+      { "Days": 30, "StorageClass": "STANDARD_IA" },
+      { "Days": 90, "StorageClass": "GLACIER" }
+    ],
+    "Expiration": { "Days": 365 }
+  }]
+}
+```
+
+**Cloudflare R2** — Dashboard → bucket → Settings → Lifecycle. R2 has a single tier (no Glacier equivalent), so policy is just `Delete after N days`. 90/180-day expiration is typical.
+
+---
+
+## Disaster recovery
+
+### Restore from cloud archive
+
+When the host VM is gone (catastrophic loss) and you need to rebuild from S3 or R2, the workflow is:
+
+1. **Provision a new VM** with voodu running.
+2. **Re-apply the postgres HCL** — voodu creates fresh empty pods, primary fails to start (no data, no archive to bootstrap from). That's expected; we'll restore over it.
+3. **Pull the latest basebackup tar + WAL** from the cloud you trust most (whichever finished its sync first wins).
+4. **Run `vd postgres:restore`** with optional `--target-time` for PITR.
+
+```bash
+# Step 1+2: provision + apply (pods spawn empty)
+vd apply -f voodu.hcl
+
+# Step 3: pull tar + WAL archive from S3
+mkdir -p /tmp/dr/wal-archive
+
+aws s3 cp s3://<your-aws-bucket>/basebackups/db-20260504.tar /tmp/dr/db-snapshot.tar
+aws s3 sync s3://<your-aws-bucket>/postgres-wal/ /tmp/dr/wal-archive/
+
+# Pre-seed the wal-archive volume so PITR's restore_command finds the WAL
+docker run --rm \
+  --volumes-from clowk-lp-db.0 \
+  -v /tmp/dr/wal-archive:/import:ro \
+  alpine sh -c "cp /import/* /wal-archive/"
+
+# Step 4: restore (latest, no PITR)
+vd postgres:restore clowk-lp/db --from /tmp/dr/db-snapshot.tar --yes
+
+# OR — restore to a specific moment (PITR)
+vd postgres:restore clowk-lp/db \
+  --from /tmp/dr/db-snapshot.tar \
+  --target-time "2026-05-04 14:30:00 UTC" \
+  --yes
+```
+
+The restore wipes PGDATA, extracts the tar, configures `recovery_target_time` (if `--target-time` passed), arms `recovery.signal`, and starts postgres. Postgres replays WAL from `/wal-archive` (where you just pre-seeded the cloud archive) until the target time, then promotes itself to primary. Standbys re-bootstrap automatically via `pg_basebackup`.
+
+### Recovery scenarios
+
+| Scenario | Recovery path |
+|---|---|
+| **Single standby pod corrupted** | `vd delete clowk-lp/db --replica 2 --prune` + `vd apply -f voodu.hcl` — the wrapper's first-boot path runs `pg_basebackup` from primary, bootstrapping a fresh standby |
+| **Old primary diverged after promote** | `vd postgres:rejoin clowk-lp/db --replica 0` — runs `pg_rewind` against new primary, reattaches as standby |
+| **Pod-0 PGDATA volume lost (still on the same host)** | Re-apply HCL → pod-0 boots empty → wrapper-treats as first-boot, BUT it's primary so initdb runs and you lose data. **DON'T** rely on this; use the basebackup tar restore path below |
+| **Whole host gone (basebackup tar still on /srv)** | `vd postgres:restore clowk-lp/db --from /srv/pg-backups/db-<date>.tar --yes` |
+| **Whole host AND `/srv` gone, but cloud archive intact** | The full disaster path — see [Restore from cloud archive](#restore-from-cloud-archive) above |
+| **Need to roll back to a specific timestamp** | Same as cloud restore but pass `--target-time "<ts>"` to `vd postgres:restore`. Postgres replays WAL until that timestamp then stops |
+
+#### RPO + RTO with the 3-cronjob setup
+
+| Scenario | RPO (data loss) | RTO (time to recover) |
+|---|---|---|
+| Standby corrupted | 0 (primary intact) | ~minutes (basebackup over network) |
+| Primary failover | depends on lag (lag check + `--force` controls this) | ~30s (promote + rolling restart) |
+| Full host loss + cloud archive | up to 15min of WAL (sync interval) | ~10-30 min (provision VM + apply + restore) |
+
+For tighter RPO on the cloud-loss scenario, drop the cronjob schedule to `*/5 * * * *` (every 5 min) — pays slightly more egress cost.
 
 ---
 
@@ -670,35 +878,9 @@ vd apply -f voodu.hcl
 vd postgres:psql clowk-lp/db -c "CREATE EXTENSION IF NOT EXISTS pgvector"
 ```
 
-### WAL archive to S3
+### WAL archive to S3 + R2 (multi-cloud durability)
 
-```hcl
-# Shared AWS creds bucket (declared once)
-asset "aws" "cli" {
-  readme = file("./shared/aws-cli.README.md")
-}
-```
-
-```bash
-vd config aws/cli set AWS_ACCESS_KEY_ID=AKIAxxx
-vd config aws/cli set AWS_SECRET_ACCESS_KEY=secretxxx
-vd config aws/cli set AWS_DEFAULT_REGION=us-east-1
-```
-
-```hcl
-postgres "clowk-lp" "db" {
-  image    = "postgres:16-bullseye-aws"   # custom image with awscli baked
-  replicas = 3
-
-  pg_config = {
-    archive_command = "aws s3 cp %p s3://my-bucket/wal/%f"
-  }
-
-  env_from = ["aws/cli"]   # AWS_ACCESS_KEY_ID etc. flow into the postgres pod
-}
-```
-
-The plugin still emits `wal_archive` (volume claim + plugin default `archive_command` in `voodu-00-wal-archive.conf`). The operator's `pg_config` override lands in `voodu-99-overrides.conf` which postgres reads LAST → S3 command wins.
+The full setup — credential buckets, sync cronjobs, lifecycle policies — lives in [Off-site WAL replication](#off-site-wal-replication-s3--r2-double-durability) under Backup automation. Recommended approach: postgres archives locally, separate cronjobs sync to S3 + R2 asynchronously. Disaster recovery from cloud is documented at [Restore from cloud archive](#restore-from-cloud-archive).
 
 ### External access for DBeaver / TablePlus
 
