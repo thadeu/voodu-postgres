@@ -169,6 +169,32 @@ func TestRenderEntrypointScript_HandsOffToDockerEntrypoint(t *testing.T) {
 	}
 }
 
+func TestRenderEntrypointScript_StandbyGuardAgainstSplitBrain(t *testing.T) {
+	// M-P5 added a guard for the post-failover scenario: pod is
+	// configured as standby (ORDINAL != PRIMARY_ORDINAL) but PGDATA
+	// has no standby.signal — meaning it was last booted as primary.
+	// Wrapper must refuse to start so postgres doesn't boot a second
+	// primary in parallel with the new one (split-brain).
+	got := renderEntrypointScript()
+
+	// Guard structure: elif checks for missing standby.signal AFTER
+	// the first-boot branch (so first-boot doesn't trip the guard).
+	if !strings.Contains(got, `elif [ ! -f "$PGDATA/standby.signal" ]; then`) {
+		t.Errorf("missing split-brain guard structure:\n%s", got)
+	}
+
+	// Must point operator at the recovery command.
+	if !strings.Contains(got, "vd postgres:rejoin") {
+		t.Errorf("guard error must mention vd postgres:rejoin recovery command:\n%s", got)
+	}
+
+	// Must exit non-zero so docker doesn't keep restarting the
+	// pod into the same broken state.
+	if !strings.Contains(got, "exit 1") {
+		t.Errorf("guard must exit 1 to avoid an endless restart loop:\n%s", got)
+	}
+}
+
 func TestRenderEntrypointScript_Deterministic(t *testing.T) {
 	// Pure function: same call must yield byte-identical output.
 	// Stability matters for asset digests — if the bytes flap

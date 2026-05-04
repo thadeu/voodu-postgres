@@ -18,10 +18,8 @@
 // What it does NOT show (deferred):
 //
 //   - Live cluster state via psql (replication lag, WAL position,
-//     pg_stat_replication output). Operator runs `vd shell <ref>
-//     psql -c "SELECT * FROM pg_stat_replication"` for that.
-//     Plugin-side psql exec adds container-shell complexity not
-//     warranted at M-P4.
+//     pg_stat_replication output). Operator runs `vd postgres:psql
+//     <ref> -c "SELECT * FROM pg_stat_replication"` for that.
 
 package main
 
@@ -57,7 +55,7 @@ DISPLAYS
 DOES NOT DISPLAY (deferred)
   Live cluster state (replication lag, pg_stat_replication, WAL
   position) — operator runs:
-    vd shell <postgres-ref> psql -U postgres -c "SELECT * FROM pg_stat_replication"
+    vd postgres:psql <postgres-ref> -c "SELECT * FROM pg_stat_replication"
 
 EXAMPLES
   vd postgres:info clowk-lp/db

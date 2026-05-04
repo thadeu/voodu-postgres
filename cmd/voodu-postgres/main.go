@@ -114,7 +114,7 @@ type expandedPayload struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		emitErr("usage: voodu-postgres <expand|link|unlink|new-password|info|expose|unexpose|defaults|help|--version>")
+		emitErr("usage: voodu-postgres <expand|link|unlink|new-password|info|expose|unexpose|failover|rejoin|psql|backup|restore|defaults|help|--version>")
 		os.Exit(1)
 	}
 
@@ -167,6 +167,40 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "failover":
+		if err := cmdFailover(); err != nil {
+			emitErr(err.Error())
+			os.Exit(1)
+		}
+
+	case "rejoin":
+		if err := cmdRejoin(); err != nil {
+			emitErr(err.Error())
+			os.Exit(1)
+		}
+
+	case "psql":
+		// psql replaces the plugin process via syscall.Exec —
+		// only reaches here when the exec fails (rare). When
+		// it succeeds, the process is replaced and main never
+		// returns.
+		if err := cmdPsql(); err != nil {
+			emitErr(err.Error())
+			os.Exit(1)
+		}
+
+	case "backup":
+		if err := cmdBackup(); err != nil {
+			emitErr(err.Error())
+			os.Exit(1)
+		}
+
+	case "restore":
+		if err := cmdRestore(); err != nil {
+			emitErr(err.Error())
+			os.Exit(1)
+		}
+
 	case "help":
 		// `vd postgres -h` reaches us as a "help" subcommand.
 		// Plain text on stdout (no envelope) — operator sees the
@@ -174,7 +208,7 @@ func main() {
 		printPluginOverview()
 
 	default:
-		emitErr(fmt.Sprintf("unknown subcommand %q (want expand|link|unlink|new-password|info|expose|unexpose|defaults|help)", os.Args[1]))
+		emitErr(fmt.Sprintf("unknown subcommand %q (want expand|link|unlink|new-password|info|expose|unexpose|failover|rejoin|psql|backup|restore|defaults|help)", os.Args[1]))
 		os.Exit(1)
 	}
 }
@@ -318,6 +352,28 @@ func cmdExpand() error {
 	return nil
 }
 
+// assetRef composes a voodu asset interpolation ref. Voodu's
+// asset kind accepts BOTH 1-label (unscoped) and 2-label (scoped)
+// declarations; the matching ref shapes are:
+//
+//	scoped (scope != ""):    ${asset.<scope>.<name>.<key>}   (4 segments)
+//	unscoped (scope == ""):  ${asset.<name>.<key>}           (3 segments)
+//
+// Using the 4-segment form on an unscoped asset produces
+// `${asset..<name>.<key>}` (double dot) which the controller's
+// asset resolver doesn't match — "asset not found" at apply time.
+//
+// Postgres resources can be declared with 0/1/2 labels, so we
+// dispatch by scope at expand time. Same logic applies to any
+// future plugin emitting asset bind-mounts.
+func assetRef(scope, name, key string) string {
+	if scope == "" {
+		return "${asset." + name + "." + key + "}"
+	}
+
+	return "${asset." + scope + "." + name + "." + key + "}"
+}
+
 // composeStatefulsetDefaults is the plugin's contribution to the
 // statefulset shape. Operator overrides win per-key (alias contract)
 // — see mergeSpec for the merge strategy.
@@ -371,11 +427,18 @@ func composeStatefulsetDefaults(scope, name string, spec *postgresSpec, password
 	// initdb on the primary's first boot. Standbys never run
 	// the init script — they pg_basebackup from primary and
 	// inherit the bootstrap state.
+	//
+	// Asset ref shape depends on whether the resource is
+	// scoped: 4-segment ${asset.<scope>.<name>.<key>} for
+	// scoped, 3-segment ${asset.<name>.<key>} for unscoped.
+	// Voodu's manifest parser registers asset blocks with the
+	// matching label count; using the wrong shape produces
+	// "asset not found" at apply time.
 	volumes := []any{
-		"${asset." + scope + "." + name + "." + entrypointAssetKey + "}:" + entrypointMountPath + ":ro",
-		"${asset." + scope + "." + name + "." + pgOverridesAssetKey + "}:" + pgOverridesMountPath + ":ro",
-		"${asset." + scope + "." + name + "." + streamingConfAssetKey + "}:" + streamingConfMountPath + ":ro",
-		"${asset." + scope + "." + name + "." + initReplicationAssetKey + "}:" + initReplicationMountPath + ":ro",
+		assetRef(scope, name, entrypointAssetKey) + ":" + entrypointMountPath + ":ro",
+		assetRef(scope, name, pgOverridesAssetKey) + ":" + pgOverridesMountPath + ":ro",
+		assetRef(scope, name, streamingConfAssetKey) + ":" + streamingConfMountPath + ":ro",
+		assetRef(scope, name, initReplicationAssetKey) + ":" + initReplicationMountPath + ":ro",
 	}
 
 	volumeClaims := []any{
@@ -392,7 +455,7 @@ func composeStatefulsetDefaults(scope, name string, spec *postgresSpec, password
 	// skips the volume_claim — postgres runs without archive
 	// mode in that case.
 	volumes = append(volumes,
-		"${asset."+scope+"."+name+"."+walArchiveAssetKey+"}:"+walArchiveMountPath+":ro",
+		assetRef(scope, name, walArchiveAssetKey)+":"+walArchiveMountPath+":ro",
 	)
 
 	if walSpec != nil && walSpec.Enabled {

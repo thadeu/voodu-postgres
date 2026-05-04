@@ -115,6 +115,59 @@ func TestComposeStatefulsetDefaults_InitdbArgsHonourLocaleAndEncoding(t *testing
 	}
 }
 
+func TestAssetRef_ScopedFourSegment(t *testing.T) {
+	got := assetRef("clowk-lp", "db", "entrypoint")
+	want := "${asset.clowk-lp.db.entrypoint}"
+
+	if got != want {
+		t.Errorf("scoped: got %q, want %q", got, want)
+	}
+}
+
+func TestAssetRef_UnscopedThreeSegment(t *testing.T) {
+	// Critical for postgres "db" {} (1-label, unscoped) operators —
+	// 4-segment with empty scope produces ${asset..db.entrypoint}
+	// (double dot) which the asset resolver can't match.
+	got := assetRef("", "db", "entrypoint")
+	want := "${asset.db.entrypoint}"
+
+	if got != want {
+		t.Errorf("unscoped: got %q, want %q", got, want)
+	}
+}
+
+func TestComposeStatefulsetDefaults_UnscopedUsesThreeSegmentAssetRefs(t *testing.T) {
+	// Pinning the unscoped flow end-to-end: every asset bind in
+	// the emitted volumes list must use the 3-segment form, not
+	// the 4-segment "${asset..name.key}" broken shape.
+	spec := mustParse(t, nil)
+	got := composeStatefulsetDefaults("", "db", spec, "pw", "repl-pw", 0, defaultWALArchiveSpec(), false)
+
+	vols, _ := got["volumes"].([]any)
+
+	for _, v := range vols {
+		s, _ := v.(string)
+		if strings.Contains(s, "${asset..") {
+			t.Errorf("found broken 4-segment ref with empty scope: %q", s)
+		}
+	}
+
+	// Spot-check at least one expected 3-segment form is present.
+	wantPrefix := "${asset.db.entrypoint}:" + entrypointMountPath
+	found := false
+
+	for _, v := range vols {
+		if s, ok := v.(string); ok && strings.HasPrefix(s, wantPrefix) {
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		t.Errorf("expected unscoped 3-segment entrypoint bind, not found in: %v", vols)
+	}
+}
+
 func TestComposeStatefulsetDefaults_VolumesIncludeAllAssetBinds(t *testing.T) {
 	// All five asset keys must be bind-mounted at the right paths
 	// (M-P1: entrypoint + pg_overrides_conf, M-P2: wal_archive_conf,

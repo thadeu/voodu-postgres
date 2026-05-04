@@ -48,3 +48,39 @@ commands:
     help: >
       Return postgres to 127.0.0.1:<port> (loopback only).
       Usage: vd postgres:unexpose <postgres-scope/name>
+
+  - name: failover
+    help: >
+      Promote a standby to primary by flipping the cluster's
+      primary ordinal. Operator runs pg_promote() on the target
+      standby BEFORE this command.
+      Usage: vd postgres:failover <postgres-scope/name> --replica <N> [--no-restart]
+
+  - name: rejoin
+    help: >
+      Re-attach a divergent pod (typically the old primary
+      post-failover) as a standby of the current primary. Runs
+      pg_rewind via docker run --volumes-from, arms standby.signal,
+      restarts the pod.
+      Usage: vd postgres:rejoin <postgres-scope/name> --replica <N>
+
+  - name: psql
+    help: >
+      Drop into psql against the cluster. No password needed —
+      goes through the unix socket inside the container (trust
+      auth). Supports interactive REPL, one-shot -c queries, and
+      passthrough psql args via `--`.
+      Usage: vd postgres:psql <postgres-scope/name> [--replica N] [-c "<sql>"] [-- <psql-args>]
+
+  - name: backup
+    help: >
+      pg_basebackup snapshot to a tar file. Source defaults to
+      the primary; --from-replica N to back up from a standby.
+      Usage: vd postgres:backup <postgres-scope/name> --destination <path> [--from-replica N]
+
+  - name: restore
+    help: >
+      Restore a cluster from a pg_basebackup tar. DESTRUCTIVE —
+      wipes PGDATA. Optional --target-time for PITR replay.
+      Requires --yes confirmation.
+      Usage: vd postgres:restore <postgres-scope/name> --from <path> [--target-time "<ts>"] --yes

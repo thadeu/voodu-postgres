@@ -196,8 +196,40 @@ if [ "$ORDINAL" != "$PRIMARY_ORDINAL" ]; then
         # WAL.
         touch "$PGDATA/standby.signal"
         log "pg_basebackup complete + standby.signal armed"
+    elif [ ! -f "$PGDATA/standby.signal" ]; then
+        # M-P5 split-brain guard. PGDATA is populated AND we're
+        # configured as a standby (ORDINAL != PRIMARY_ORDINAL),
+        # but standby.signal is absent — this means PGDATA was
+        # last used as a primary. Almost certainly the result of
+        # a failover (PG_PRIMARY_ORDINAL flipped to a different
+        # ordinal) where this pod USED to be the primary.
+        #
+        # If we proceeded, postgres would boot WITHOUT
+        # standby.signal, ignore primary_conninfo, and start as
+        # a writable primary — running in parallel with the new
+        # primary on the same DNS round-robin. That's split-brain;
+        # data divergence happens within seconds.
+        #
+        # Refuse to start. Operator runs vd postgres:rejoin to
+        # pg_rewind this pod against the current primary and arm
+        # standby.signal, then a normal restart resumes streaming.
+        log "ERROR: pod ordinal=$ORDINAL is configured as STANDBY (primary=$PRIMARY_ORDINAL),"
+        log "       but PGDATA was last used as primary (no standby.signal found)."
+        log "       This usually means a failover happened and this pod must be"
+        log "       reattached to the new primary."
+        log ""
+        log "       Recovery:"
+        log "         vd postgres:rejoin <postgres-scope/name> --replica $ORDINAL"
+        log ""
+        log "       That command runs pg_rewind against the current primary, arms"
+        log "       standby.signal, and restarts this pod to resume streaming."
+        log ""
+        log "       If pg_rewind fails (data divergence too large), the fallback"
+        log "       is to wipe this pod's data volume and re-apply — the wrapper"
+        log "       will then bootstrap a fresh standby via pg_basebackup."
+        exit 1
     else
-        log "PGDATA already populated — skipping basebackup (subsequent boot)"
+        log "PGDATA already populated + standby.signal present — resuming as standby (subsequent boot)"
     fi
 else
     log "role=PRIMARY (ordinal=$ORDINAL)"

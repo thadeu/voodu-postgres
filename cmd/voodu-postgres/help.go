@@ -27,6 +27,11 @@ COMMANDS
   info            show cluster topology, ports, linked consumers
   expose          publish postgres on 0.0.0.0 (Internet-facing)
   unexpose        return postgres to 127.0.0.1 (loopback only)
+  failover        promote a standby to primary (manual; pg_promote first)
+  rejoin          re-attach a divergent pod as standby (post-failover recovery)
+  psql            interactive psql against the cluster (no password needed)
+  backup          pg_basebackup snapshot to a tar file
+  restore         restore from a tar (DESTRUCTIVE; supports PITR)
   help            this text
 
   Pass --help to any subcommand for full usage:

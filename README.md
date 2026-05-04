@@ -18,9 +18,14 @@ Bare block produces a single hardened primary; `replicas = 3` flips it into a cl
   - [Cluster shape](#cluster-shape)
   - [Cold-start sequence](#cold-start-sequence)
   - [Write vs read endpoints](#write-vs-read-endpoints)
+  - [Manual failover](#manual-failover)
+  - [Rejoining the old primary](#rejoining-the-old-primary)
 - [Backup automation](#backup-automation)
-  - [What the plugin gives you](#what-the-plugin-gives-you)
-  - [Cleanup pattern (operator cronjob)](#cleanup-pattern-operator-cronjob)
+  - [`vd postgres:backup`](#vd-postgresbackup)
+  - [`vd postgres:restore`](#vd-postgresrestore)
+  - [WAL cleanup pattern](#wal-cleanup-pattern)
+  - [Scheduled backups](#scheduled-backups)
+- [Connecting via `psql`](#connecting-via-psql)
 - [Real-world examples](#real-world-examples)
   - [Single primary + Rails app](#single-primary--rails-app)
   - [3-replica cluster + Rails MultiDB](#3-replica-cluster--rails-multidb)
@@ -214,7 +219,7 @@ RUN apt-get update && apt-get install -y postgresql-16-pgvector \
 
 The same image must work as primary AND standby (standbys clone primary via `pg_basebackup`, no separate image).
 
-Extensions: enable inside the database via your app's migration system (Rails `enable_extension :pgvector`, Django RunSQL, etc.) OR with a one-off `vd shell <ref> psql -c "CREATE EXTENSION IF NOT EXISTS pgvector"`.
+Extensions: enable inside the database via your app's migration system (Rails `enable_extension :pgvector`, Django RunSQL, etc.) OR with a one-off `vd postgres:psql <ref> -c "CREATE EXTENSION IF NOT EXISTS pgvector"`.
 
 ### WAL archive
 
@@ -393,20 +398,99 @@ Standby retry: if primary isn't ready (race during first cluster apply), the wra
 
 Without `--reads`, only `DATABASE_URL` is emitted (single primary endpoint). Apps without read-replica logic just use that.
 
+### Manual failover
+
+`vd postgres:failover` flips the cluster's primary ordinal. Workflow is **3 explicit steps** — the plugin doesn't auto-promote because that's destructive of the old primary's writability.
+
+```bash
+# Step 1: PROMOTE — operator runs pg_promote() on the target standby.
+#         Verify replication lag FIRST (or you may lose writes):
+vd postgres:psql clowk-lp/db --replica 0 \
+  -c "SELECT pid, application_name, state, sync_state, replay_lsn
+      FROM pg_stat_replication;"
+
+vd postgres:psql clowk-lp/db --replica 1 -c "SELECT pg_promote();"
+
+# Step 2: FAILOVER — flip PG_PRIMARY_ORDINAL + refresh DATABASE_URL on
+#         every linked consumer + trigger rolling restart so all pods
+#         re-read streaming.conf with the new primary FQDN.
+vd postgres:failover clowk-lp/db --replica 1
+
+# Step 3: REJOIN — recover the OLD primary as a standby of the new one.
+#         Required because the rolling restart will hit pod-0 with
+#         PG_PRIMARY_ORDINAL=1 but PGDATA still in primary state — the
+#         wrapper's split-brain guard catches it and refuses to start.
+vd postgres:rejoin clowk-lp/db --replica 0
+```
+
+Flags:
+- `--no-restart` on `failover` — flip the bucket + URLs but skip the rolling restart. Useful for staged failovers (verify, then restart on demand).
+
+### Rejoining the old primary
+
+`vd postgres:rejoin` runs `pg_rewind` against the current primary inside a one-shot container that shares the target pod's data volume (`docker run --volumes-from`). Steps:
+
+1. `docker stop <container>` — pg_rewind requires the target offline
+2. `docker run --rm --volumes-from <container> postgres:<ver> pg_rewind --target-pgdata=… --source-server="host=<primary> user=replicator …"`
+3. `touch standby.signal` in the data dir
+4. `docker start <container>` — pod boots as standby, picks up streaming from the new primary
+
+**When `pg_rewind` fails**: divergence too large (WAL recycled past the divergence point) yields `could not find previous WAL record at…`. Fallback:
+
+```bash
+vd delete clowk-lp/db --replica 0 --prune    # wipes the data volume
+vd apply -f voodu.hcl                         # wrapper bootstraps fresh standby via pg_basebackup
+```
+
+The wrapper script's split-brain guard prevents accidental writes during this window — if a pod is configured as standby (`ORDINAL != PG_PRIMARY_ORDINAL`) but PGDATA was last used as primary (no `standby.signal`), it exits 1 with a clear message pointing at `vd postgres:rejoin`.
+
 ---
 
 ## Backup automation
 
-### What the plugin gives you
+### `vd postgres:backup`
 
-- **WAL archive ON by default** (`/wal-archive` volume claim, idempotent local cp)
-- **`pg_basebackup` is built into postgres** — operator runs it on demand from a job/cronjob/shell session
+`pg_basebackup` snapshot to a tar file. Plugin spawns a one-shot container that shares the source pod's network namespace (`db-N.scope.voodu` resolves via voodu0 DNS) and streams the backup to the operator-supplied destination path on the host:
 
-What's NOT (yet) in the plugin: a dedicated `vd postgres:backup` / `vd postgres:restore` command. Lands in M-P6. Today's pattern: declare a cronjob in HCL that runs `pg_basebackup`.
+```bash
+# Default: backup from the current primary
+vd postgres:backup clowk-lp/db --destination /srv/backups/db-20260504.tar
 
-### Cleanup pattern (operator cronjob)
+# Offload from a standby (avoids write contention on primary)
+vd postgres:backup clowk-lp/db --destination /srv/backups/db.tar --from-replica 1
+```
 
-WAL files accumulate forever under default settings — postgres doesn't auto-prune the archive. Declare a cleanup cronjob:
+Output is a tar with `base.tar` + `pg_wal.tar` (`-X stream` includes WAL needed to make the backup self-consistent — restore needs no archive_command access).
+
+### `vd postgres:restore`
+
+**DESTRUCTIVE** — wipes PGDATA on every pod, extracts the backup into the primary, then bootstraps standbys via `pg_basebackup`. Refuses to run without `--yes`.
+
+```bash
+# Latest restore (no PITR — replay all available WAL)
+vd postgres:restore clowk-lp/db --from /srv/backups/db.tar --yes
+
+# Point-in-time recovery to just before a bad migration
+vd postgres:restore clowk-lp/db \
+  --from /srv/backups/db.tar \
+  --target-time "2026-05-04 14:30:00 UTC" \
+  --yes
+```
+
+Workflow internals:
+
+1. `docker stop` every pod (primary + standbys)
+2. Wipe primary's PGDATA via `docker run --volumes-from`
+3. Extract backup tar into PGDATA (one-shot container shares the volume)
+4. (PITR) Append `recovery_target_time = '<ts>'` + `restore_command = 'cp /wal-archive/%f %p'` to `postgresql.auto.conf`, drop `recovery.signal`
+5. `docker start` primary — postgres replays WAL on startup, promotes when target reached
+6. Wipe each standby's PGDATA + start — wrapper's first-boot path bootstraps via `pg_basebackup` against the just-restored primary
+
+**When pg_rewind/restore fails on a standby**: same fallback as M-P5 rejoin — `vd delete --replica N --prune` + re-apply forces a fresh standby bootstrap.
+
+### WAL cleanup pattern
+
+Plugin doesn't auto-prune the WAL archive — declare a cleanup cronjob:
 
 ```hcl
 cronjob "clowk-lp" "wal-cleanup" {
@@ -421,26 +505,52 @@ cronjob "clowk-lp" "wal-cleanup" {
 }
 ```
 
-The volume name follows voodu's deterministic `voodu-<scope>-<name>-<claim>-<ordinal>` convention. Only ordinal 0 archives.
-
 For S3/R2 archives (operator-overridden `archive_command`), no cleanup cronjob needed — set bucket lifecycle policy on the cloud side.
 
-Backup cronjob example (snapshot via `pg_basebackup`):
+### Scheduled backups
+
+Wrap `vd postgres:backup` in a voodu cronjob:
 
 ```hcl
 cronjob "clowk-lp" "db-backup" {
   schedule = "0 3 * * *"               # daily at 03:00
-  image    = "postgres:16"
-  command  = ["bash", "-c", "pg_basebackup -h db-0.clowk-lp.voodu -U postgres -D /backup/$(date +%Y%m%d) -X stream -P"]
+  image    = "ghcr.io/clowk/voodu-cli:latest"   # has vd binary
 
-  env_from = ["clowk-lp/db"]           # POSTGRES_PASSWORD via PGPASSWORD
-  env = {
-    PGPASSWORD = "$POSTGRES_PASSWORD"
-  }
+  command = ["bash", "-c", "vd postgres:backup clowk-lp/db --destination /backup/db-$(date +%Y%m%d).tar --from-replica 1"]
 
   volumes = ["/srv/pg-backups:/backup:rw"]
 }
 ```
+
+S3/R2 upload — pipe through awscli or rclone in the cronjob command, or use a separate sync cronjob.
+
+---
+
+## Connecting via `psql`
+
+`vd postgres:psql` shells into postgres without password — connection goes through the container's unix socket (trust auth in the stock pg_hba.conf):
+
+```bash
+# Interactive REPL on primary
+vd postgres:psql clowk-lp/db
+
+# Interactive on a standby (read-only)
+vd postgres:psql clowk-lp/db --replica 1
+
+# One-shot query
+vd postgres:psql clowk-lp/db -c "SELECT version();"
+
+# Replication status — debug standby lag
+vd postgres:psql clowk-lp/db -c "SELECT * FROM pg_stat_replication;"
+
+# CSV output via passthrough flag
+vd postgres:psql clowk-lp/db -- --csv -c "SELECT * FROM pg_stat_database"
+
+# Manual failover step 1
+vd postgres:psql clowk-lp/db --replica 1 -c "SELECT pg_promote();"
+```
+
+Heroku-style — operator doesn't need to know password, host, or user. Plugin reads `POSTGRES_USER`/`POSTGRES_DB` from the statefulset env to compose the right `psql -U <user> -d <db>` invocation.
 
 ---
 
@@ -554,7 +664,7 @@ vd apply -f voodu.hcl
 # Django: from pgvector.django import VectorField
 
 # OR inline:
-vd shell clowk-lp/db psql -U postgres -c "CREATE EXTENSION IF NOT EXISTS pgvector"
+vd postgres:psql clowk-lp/db -c "CREATE EXTENSION IF NOT EXISTS pgvector"
 ```
 
 ### WAL archive to S3
@@ -621,6 +731,11 @@ vd postgres:unexpose clowk-lp/db
 | `vd postgres:info <postgres> [-o json]` | Cluster topology snapshot (text or JSON) |
 | `vd postgres:expose <postgres>` | Publish on 0.0.0.0:`<port>` (Internet-facing) |
 | `vd postgres:unexpose <postgres>` | Return to 127.0.0.1:`<port>` (loopback only) |
+| `vd postgres:failover <postgres> --replica <N> [--no-restart]` | Promote a standby to primary (operator runs `pg_promote()` first) |
+| `vd postgres:rejoin <postgres> --replica <N>` | Re-attach a divergent pod as standby via `pg_rewind` |
+| `vd postgres:psql <postgres> [--replica N] [-c "<sql>"]` | Drop into psql against the cluster (no password needed) |
+| `vd postgres:backup <postgres> --destination <path> [--from-replica N]` | `pg_basebackup` snapshot to a tar file |
+| `vd postgres:restore <postgres> --from <path> [--target-time "<ts>"] --yes` | Restore from a tar (DESTRUCTIVE; PITR via `--target-time`) |
 | `vd postgres:help` | Plugin overview |
 
 Pass `--help` to any subcommand for full usage.
@@ -657,9 +772,10 @@ The `voodu-NN-` prefixes order the include_dir scan: plugin defaults (00, 50) lo
 | Key | Owner | Purpose |
 |---|---|---|
 | `POSTGRES_PASSWORD` | plugin auto-gen | Superuser password — read by `link`, rotated by `new-password` |
-| `POSTGRES_REPLICATION_PASSWORD` | plugin auto-gen | Replication user password — read by streaming.conf renderer |
-| `POSTGRES_LINKED_CONSUMERS` | `vd postgres:link/unlink` | Comma-separated `<scope>/<name>` refs for `new-password` fan-out |
+| `POSTGRES_REPLICATION_PASSWORD` | plugin auto-gen | Replication user password — read by streaming.conf renderer + `rejoin` |
+| `POSTGRES_LINKED_CONSUMERS` | `vd postgres:link/unlink` | Comma-separated `<scope>/<name>` refs for `new-password`/`failover` fan-out |
 | `PG_EXPOSE_PUBLIC` | `vd postgres:expose/unexpose` | `"true"` flips ports to 0.0.0.0; absent = loopback |
+| `PG_PRIMARY_ORDINAL` | `vd postgres:failover` | Current primary ordinal (default `0`); flipped by failover, read by wrapper script + streaming.conf renderer |
 
 Operator can read all of these via `vd config <ref>`. Setting them manually before first apply pre-seeds (useful for dev environments wanting deterministic passwords).
 
