@@ -1,6 +1,6 @@
 name: postgres
 aliases: [pg]
-version: 0.9.0
+version: 0.10.0
 description: >
   Voodu plugin for postgres clusters. Single primary + N standbys
   via streaming replication, WAL archive (local default,
@@ -10,6 +10,11 @@ description: >
   with PITR. Heroku-style `vd pg:<cmd>` shortcut works alongside
   the canonical `vd postgres:<cmd>`.
 homepage: https://github.com/thadeu/voodu-postgres
+
+# All commands route to the single binary; voodu-postgres dispatches
+# internally on os.Args[1]. No bin/<command> shims needed — drop the
+# binary in bin/ and declare commands here.
+entrypoint: bin/voodu-postgres
 
 commands:
   - name: expand
@@ -94,3 +99,55 @@ commands:
       wipes PGDATA. Optional --target-time for PITR replay.
       Requires --yes confirmation.
       Usage: vd postgres:restore <postgres-scope/name> --from <path> [--target-time "<ts>"] --yes
+
+  - name: backups
+    help: >
+      List backups + status (running / complete / failed).
+      Usage: vd pg:backups <postgres-scope/name> [-o json]
+
+  - name: backups:capture
+    help: >
+      Spawn pg_dump in a sibling job. Detached by default
+      (returns the new ID immediately); --follow streams logs +
+      progress. Detached path emits apply_manifest + run_job
+      dispatch actions; --follow stays docker-direct.
+      Usage: vd pg:backups:capture <postgres-scope/name> [--from-replica N] [--follow]
+
+  - name: backups:logs
+    help: >
+      docker logs on a backup container.
+      Usage: vd pg:backups:logs <postgres-scope/name> <backup-id> [--follow]
+
+  - name: backups:restore
+    help: >
+      pg_restore from a local backup id or http(s) URL into the
+      live database. DESTRUCTIVE of database content (drops +
+      recreates objects in the dump); non-destructive of cluster.
+      Requires --yes confirmation.
+      Usage: vd pg:backups:restore <postgres-scope/name> <id|url> --yes
+
+  - name: backups:download
+    help: >
+      Copy a backup file from the pod to the host via docker cp.
+      Usage: vd pg:backups:download <postgres-scope/name> <id> [--to <path>]
+
+  - name: backups:delete
+    help: >
+      Remove a backup file (host-side os.Remove) plus emit
+      delete_manifest to clean the residual job manifest. Requires
+      --yes confirmation.
+      Usage: vd pg:backups:delete <postgres-scope/name> <id> --yes
+
+  - name: backups:schedule
+    help: >
+      Print a cronjob HCL template for paste-and-apply scheduling
+      of backup captures. No state mutation — pure template helper.
+      Usage: vd pg:backups:schedule <postgres-scope/name> [--at <cron>] [--from-replica N]
+
+  - name: backups:cancel
+    help: >
+      Cancel running captures by emitting delete_manifest for each
+      in-flight backup job. Voodu's JobHandler.remove SIGTERMs the
+      container. Without an ID, cancels all running captures for
+      the cluster.
+      Usage: vd pg:backups:cancel <postgres-scope/name> [<backup-id>]
