@@ -1881,10 +1881,33 @@ func cmdBackupsLogs() error {
 		return fmt.Errorf("backup id %q: invalid number after 'b'", id)
 	}
 
-	jobContainer := composeBackupContainerName(scope, name, n)
+	// Look up the container by ID via the docker labels scan.
+	// This handles BOTH naming conventions:
+	//
+	//   - Caminho A (--follow detached): container exact name
+	//     `<scope>-<name>-backup-bNNN` (no runID suffix).
+	//   - Caminho B (default detached, voodu jobs): container
+	//     name `<scope>-<name>-backup-bNNN-<runID>` (voodu's
+	//     containers.ContainerName appends runID for audit).
+	//
+	// composeBackupContainerName + containerExists would only
+	// match Caminho A — Caminho B containers slip through.
+	// listBackupContainers parses both forms via parseContainerNameForID.
+	containers, err := listBackupContainers(scope, name)
+	if err != nil {
+		return err
+	}
 
-	if !containerExists(jobContainer) {
-		return fmt.Errorf("backup container %s not found (auto-pruned, or capture never started)", jobContainer)
+	var jobContainer string
+	for _, c := range containers {
+		if c.ID == n {
+			jobContainer = c.Name
+			break
+		}
+	}
+
+	if jobContainer == "" {
+		return fmt.Errorf("backup b%03d not found (auto-pruned, or capture never started)", n)
 	}
 
 	logsArgs := []string{"logs"}
