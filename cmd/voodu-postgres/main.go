@@ -77,11 +77,28 @@ type manifest struct {
 }
 
 // dispatchAction is a side-effect the controller applies after
-// the expand returns. Types in use:
+// the expand or dispatch command returns. Mirrors the wire shape
+// the controller's pluginDispatchAction expects — fields are
+// kept in lockstep so plugin authors get a single Go struct that
+// covers every action type the controller recognises.
 //
-//   - `config_set` — write KV pairs to the bucket (persisting
-//     auto-gen state, link URLs, expose flag, etc.)
-//   - `config_unset` — delete Keys from the bucket (unlink, unexpose)
+// Types:
+//
+//   - `config_set`       — write KV pairs to the (Scope, Name) bucket
+//   - `config_unset`     — remove Keys from the (Scope, Name) bucket
+//   - `apply_manifest`   — Store.Put the embedded Manifest. Action's
+//                          Scope/Name are the OWNER context (used
+//                          for audit only — restart fan-out is
+//                          suppressed for this action type because
+//                          the watch loop reconciles the manifest
+//                          via its kind handler).
+//   - `delete_manifest`  — Store.Delete (Kind, Scope, Name). Same
+//                          fan-out suppression as apply_manifest.
+//
+// Plugins that materialise runtime resources (e.g. spawning a
+// one-shot job for a backup capture) emit apply_manifest +
+// delete_manifest instead of touching docker / etcd directly.
+// The controller is the single mediator for all writes.
 type dispatchAction struct {
 	Type  string            `json:"type"`
 	Scope string            `json:"scope"`
@@ -93,6 +110,8 @@ type dispatchAction struct {
 	// WITHOUT triggering the usual restart fan-out on (Scope, Name).
 	// Default false (omitted in JSON) — config_set normally
 	// triggers a rolling restart so the new value takes effect.
+	// Ignored by apply_manifest / delete_manifest (which already
+	// suppress fan-out by design).
 	//
 	// Used by:
 	//
@@ -103,6 +122,39 @@ type dispatchAction struct {
 	//
 	//   - cmdNewPassword --no-restart for staged rotations.
 	SkipRestart bool `json:"skip_restart,omitempty"`
+
+	// Manifest carries the apply_manifest payload — the full
+	// resource spec the controller will Store.Put. Empty for
+	// other action types.
+	Manifest *dispatchManifest `json:"manifest,omitempty"`
+
+	// Kind carries the delete_manifest target kind. Scope/Name
+	// come from the top-level fields above. Empty for other
+	// action types.
+	Kind string `json:"kind,omitempty"`
+}
+
+// dispatchManifest is the wire shape for apply_manifest payloads.
+// Mirrors the controller's pluginDispatchManifest — kind+scope+
+// name+spec, no metadata (controller fills it in on Put).
+//
+// Spec is map[string]any so plugin authors can compose it via
+// literal Go maps without juggling json.RawMessage:
+//
+//	&dispatchManifest{
+//	    Kind:  "job",
+//	    Scope: "clowk-lp",
+//	    Name:  "db-backup-b008",
+//	    Spec: map[string]any{
+//	        "image":   "postgres:16",
+//	        "command": []string{"bash", "-c", "pg_dump ..."},
+//	    },
+//	}
+type dispatchManifest struct {
+	Kind  string         `json:"kind"`
+	Scope string         `json:"scope,omitempty"`
+	Name  string         `json:"name"`
+	Spec  map[string]any `json:"spec"`
 }
 
 // expandedPayload is the envelope-data shape the controller's
@@ -114,7 +166,7 @@ type expandedPayload struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		emitErr("usage: voodu-postgres <expand|link|unlink|new-password|info|expose|unexpose|promote|rejoin|psql|backup|restore|backups|backups:capture|backups:restore|backups:download|backups:delete|backups:schedule|backups:cancel|defaults|help|--version>")
+		emitErr("usage: voodu-postgres <expand|link|unlink|new-password|info|expose|unexpose|promote|rejoin|psql|backup|restore|backups|backups:capture|backups:restore|backups:download|backups:delete|backups:schedule|backups:cancel|backups:logs|defaults|help|--version>")
 		os.Exit(1)
 	}
 
@@ -251,9 +303,17 @@ func main() {
 		}
 
 	case "backups:cancel":
-		// `vd pg:backups:cancel <ref>` — pg_terminate_backend on
-		// any pg_dump or pg_restore in progress.
+		// `vd pg:backups:cancel <ref> [<id>]` — docker stop on
+		// running backup containers.
 		if err := cmdBackupsCancel(); err != nil {
+			emitErr(err.Error())
+			os.Exit(1)
+		}
+
+	case "backups:logs":
+		// `vd pg:backups:logs <ref> <id> [--follow]` — docker logs
+		// on a backup container.
+		if err := cmdBackupsLogs(); err != nil {
 			emitErr(err.Error())
 			os.Exit(1)
 		}
@@ -265,7 +325,7 @@ func main() {
 		printPluginOverview()
 
 	default:
-		emitErr(fmt.Sprintf("unknown subcommand %q (want expand|link|unlink|new-password|info|expose|unexpose|promote|rejoin|psql|backup|restore|backups|backups:capture|backups:restore|backups:download|backups:delete|backups:schedule|backups:cancel|defaults|help)", os.Args[1]))
+		emitErr(fmt.Sprintf("unknown subcommand %q (want expand|link|unlink|new-password|info|expose|unexpose|promote|rejoin|psql|backup|restore|backups|backups:capture|backups:restore|backups:download|backups:delete|backups:schedule|backups:cancel|backups:logs|defaults|help)", os.Args[1]))
 		os.Exit(1)
 	}
 }

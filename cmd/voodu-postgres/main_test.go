@@ -26,6 +26,7 @@
 package main
 
 import (
+	"encoding/json"
 	"reflect"
 	"sort"
 	"strings"
@@ -493,5 +494,120 @@ func mustParse(t *testing.T, in map[string]any) *postgresSpec {
 	}
 
 	return spec
+}
+
+// TestDispatchAction_ApplyManifestSerializes pins the wire shape
+// the controller's apply_manifest handler expects: top-level
+// type/scope/name, embedded manifest with kind/scope/name/spec.
+// Keep this test in lockstep with the controller's
+// pluginDispatchAction shape — both sides deserialize the same
+// JSON, so any drift between repos breaks dispatch.
+func TestDispatchAction_ApplyManifestSerializes(t *testing.T) {
+	action := dispatchAction{
+		Type:  "apply_manifest",
+		Scope: "clowk-lp",
+		Name:  "db",
+		Manifest: &dispatchManifest{
+			Kind:  "job",
+			Scope: "clowk-lp",
+			Name:  "db-backup-b008",
+			Spec: map[string]any{
+				"image":   "postgres:16",
+				"command": []any{"bash", "-c", "pg_dump ..."},
+			},
+		},
+	}
+
+	raw, err := json.Marshal(action)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if decoded["type"] != "apply_manifest" {
+		t.Errorf("type: %v", decoded["type"])
+	}
+
+	manifest, ok := decoded["manifest"].(map[string]any)
+	if !ok {
+		t.Fatalf("manifest field: %T", decoded["manifest"])
+	}
+
+	if manifest["kind"] != "job" {
+		t.Errorf("manifest.kind: %v", manifest["kind"])
+	}
+
+	if manifest["name"] != "db-backup-b008" {
+		t.Errorf("manifest.name: %v", manifest["name"])
+	}
+
+	spec, ok := manifest["spec"].(map[string]any)
+	if !ok {
+		t.Fatalf("manifest.spec: %T", manifest["spec"])
+	}
+
+	if spec["image"] != "postgres:16" {
+		t.Errorf("spec.image: %v", spec["image"])
+	}
+}
+
+// TestDispatchAction_OmitsEmptyManifestForConfigSet ensures the
+// `manifest` field is omitempty — config_set actions must NOT
+// carry an empty manifest object on the wire.
+func TestDispatchAction_OmitsEmptyManifestForConfigSet(t *testing.T) {
+	action := dispatchAction{
+		Type:  "config_set",
+		Scope: "clowk-lp",
+		Name:  "web",
+		KV:    map[string]string{"X": "y"},
+	}
+
+	raw, _ := json.Marshal(action)
+
+	if strings.Contains(string(raw), "\"manifest\"") {
+		t.Errorf("config_set must not carry manifest field: %s", raw)
+	}
+
+	if strings.Contains(string(raw), "\"kind\"") {
+		t.Errorf("config_set must not carry kind field: %s", raw)
+	}
+}
+
+// TestDispatchAction_DeleteManifestSerializes pins the wire shape
+// for delete_manifest: kind alongside top-level scope/name, no
+// embedded manifest payload.
+func TestDispatchAction_DeleteManifestSerializes(t *testing.T) {
+	action := dispatchAction{
+		Type:  "delete_manifest",
+		Scope: "clowk-lp",
+		Name:  "db-backup-b008",
+		Kind:  "job",
+	}
+
+	raw, err := json.Marshal(action)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if decoded["type"] != "delete_manifest" {
+		t.Errorf("type: %v", decoded["type"])
+	}
+
+	if decoded["kind"] != "job" {
+		t.Errorf("kind: %v", decoded["kind"])
+	}
+
+	if _, present := decoded["manifest"]; present {
+		t.Errorf("manifest field should be omitted for delete_manifest: %v", decoded)
+	}
 }
 

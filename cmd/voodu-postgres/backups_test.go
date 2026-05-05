@@ -345,15 +345,19 @@ func TestParseCaptureFlags_FromReplica(t *testing.T) {
 		wantPos      []string
 		wantReplica  int
 		wantHasFlag  bool
+		wantFollow   bool
 	}{
-		{[]string{"clowk-lp/db"}, []string{"clowk-lp/db"}, 0, false},
-		{[]string{"clowk-lp/db", "--from-replica", "1"}, []string{"clowk-lp/db"}, 1, true},
-		{[]string{"clowk-lp/db", "--from-replica=2"}, []string{"clowk-lp/db"}, 2, true},
-		{[]string{"--from-replica", "3", "ref"}, []string{"ref"}, 3, true},
+		{[]string{"clowk-lp/db"}, []string{"clowk-lp/db"}, 0, false, false},
+		{[]string{"clowk-lp/db", "--from-replica", "1"}, []string{"clowk-lp/db"}, 1, true, false},
+		{[]string{"clowk-lp/db", "--from-replica=2"}, []string{"clowk-lp/db"}, 2, true, false},
+		{[]string{"--from-replica", "3", "ref"}, []string{"ref"}, 3, true, false},
+		{[]string{"clowk-lp/db", "--follow"}, []string{"clowk-lp/db"}, 0, false, true},
+		{[]string{"clowk-lp/db", "-f"}, []string{"clowk-lp/db"}, 0, false, true},
+		{[]string{"clowk-lp/db", "--from-replica", "1", "--follow"}, []string{"clowk-lp/db"}, 1, true, true},
 	}
 
 	for _, tc := range cases {
-		pos, replica, hasFlag, err := parseCaptureFlags(tc.args)
+		pos, replica, hasFlag, follow, err := parseCaptureFlags(tc.args)
 		if err != nil {
 			t.Errorf("parseCaptureFlags(%v): unexpected err: %v", tc.args, err)
 			continue
@@ -367,6 +371,10 @@ func TestParseCaptureFlags_FromReplica(t *testing.T) {
 			t.Errorf("replica for %v: got %d, want %d", tc.args, replica, tc.wantReplica)
 		}
 
+		if follow != tc.wantFollow {
+			t.Errorf("follow for %v: got %v, want %v", tc.args, follow, tc.wantFollow)
+		}
+
 		if len(pos) != len(tc.wantPos) {
 			t.Errorf("positional for %v: got %v, want %v", tc.args, pos, tc.wantPos)
 		}
@@ -376,7 +384,7 @@ func TestParseCaptureFlags_FromReplica(t *testing.T) {
 func TestParseCaptureFlags_MissingValue(t *testing.T) {
 	args := []string{"ref", "--from-replica"}
 
-	_, _, _, err := parseCaptureFlags(args)
+	_, _, _, _, err := parseCaptureFlags(args)
 	if err == nil {
 		t.Error("expected error for --from-replica without value")
 	}
@@ -385,7 +393,7 @@ func TestParseCaptureFlags_MissingValue(t *testing.T) {
 func TestParseCaptureFlags_InvalidInteger(t *testing.T) {
 	args := []string{"ref", "--from-replica", "abc"}
 
-	_, _, _, err := parseCaptureFlags(args)
+	_, _, _, _, err := parseCaptureFlags(args)
 	if err == nil {
 		t.Error("expected error for non-integer --from-replica")
 	}
@@ -559,7 +567,7 @@ func TestBackupsDeleteHelpMentionsDestructive(t *testing.T) {
 	wantPhrases := []string{
 		"DESTRUCTIVE",
 		"--yes",
-		"rm /backups/",
+		"os.Remove",
 	}
 
 	for _, want := range wantPhrases {
@@ -810,16 +818,265 @@ func TestFormatProgressLine_ZeroBytes(t *testing.T) {
 	}
 }
 
-func TestBackupsCancelHelpMentionsTerminate(t *testing.T) {
+func TestBackupsCancelHelpMentionsDispatchAndSemantics(t *testing.T) {
+	// Help text for the migrated cancel: emits delete_manifest
+	// dispatch actions; voodu's JobHandler.remove sends SIGTERM.
 	wantPhrases := []string{
-		"pg_terminate_backend",
+		"delete_manifest",
 		"pg_dump",
-		"pg_restore",
+		"SIGTERM",
 	}
 
 	for _, want := range wantPhrases {
 		if !strings.Contains(backupsCancelHelp, want) {
 			t.Errorf("backupsCancelHelp missing %q", want)
+		}
+	}
+}
+
+func TestComposeBackupContainerName(t *testing.T) {
+	cases := []struct {
+		scope, name string
+		id          int
+		want        string
+	}{
+		{"clowk-lp", "db", 1, "clowk-lp-db-backup-b001"},
+		{"clowk-lp", "db", 42, "clowk-lp-db-backup-b042"},
+		{"clowk-lp", "db", 1000, "clowk-lp-db-backup-b1000"},
+		{"", "db", 7, "db-backup-b007"},
+		{"data", "main", 99, "data-main-backup-b099"},
+	}
+
+	for _, tc := range cases {
+		got := composeBackupContainerName(tc.scope, tc.name, tc.id)
+		if got != tc.want {
+			t.Errorf("composeBackupContainerName(%q, %q, %d): got %q, want %q",
+				tc.scope, tc.name, tc.id, got, tc.want)
+		}
+	}
+}
+
+func TestComposeBackupContainerPrefix(t *testing.T) {
+	cases := []struct {
+		scope, name, want string
+	}{
+		{"clowk-lp", "db", "clowk-lp-db-backup-"},
+		{"", "db", "db-backup-"},
+		{"data", "main", "data-main-backup-"},
+	}
+
+	for _, tc := range cases {
+		got := composeBackupContainerPrefix(tc.scope, tc.name)
+		if got != tc.want {
+			t.Errorf("composeBackupContainerPrefix(%q, %q): got %q, want %q",
+				tc.scope, tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestParseContainerNameForID(t *testing.T) {
+	prefix := "clowk-lp-db-backup-"
+
+	cases := []struct {
+		name    string
+		wantID  int
+		wantOK  bool
+	}{
+		{"clowk-lp-db-backup-b001", 1, true},
+		{"clowk-lp-db-backup-b042", 42, true},
+		{"clowk-lp-db-backup-b1000", 1000, true},
+		// wrong prefix
+		{"other-scope-db-backup-b001", 0, false},
+		// missing 'b' marker
+		{"clowk-lp-db-backup-001", 0, false},
+		// non-numeric tail
+		{"clowk-lp-db-backup-bxyz", 0, false},
+		// empty after prefix
+		{"clowk-lp-db-backup-", 0, false},
+	}
+
+	for _, tc := range cases {
+		gotID, gotOK := parseContainerNameForID(tc.name, prefix)
+
+		if gotOK != tc.wantOK {
+			t.Errorf("parseContainerNameForID(%q): ok=%v, want %v", tc.name, gotOK, tc.wantOK)
+			continue
+		}
+
+		if gotOK && gotID != tc.wantID {
+			t.Errorf("parseContainerNameForID(%q): id=%d, want %d", tc.name, gotID, tc.wantID)
+		}
+	}
+}
+
+func TestParseExitCodeFromStatus(t *testing.T) {
+	cases := []struct {
+		status string
+		want   int
+	}{
+		{"Up 2 minutes", 0},
+		{"Up About a minute (healthy)", 0},
+		{"Exited (0) 3 minutes ago", 0},
+		{"Exited (1) 3 minutes ago", 1},
+		{"Exited (137) 1 hour ago", 137},
+		// Created state — no exit code yet, treat as 0.
+		{"Created", 0},
+		// Defensive: malformed
+		{"Exited (xx) blah", 0},
+		{"Exited () blah", 0},
+		{"", 0},
+	}
+
+	for _, tc := range cases {
+		got := parseExitCodeFromStatus(tc.status)
+		if got != tc.want {
+			t.Errorf("parseExitCodeFromStatus(%q): got %d, want %d", tc.status, got, tc.want)
+		}
+	}
+}
+
+func TestMergeBackupListing_FilesOnly(t *testing.T) {
+	files := []backupEntry{
+		{ID: 1, Filename: "b001-...dump", SizeBytes: 100, Timestamp: time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)},
+		{ID: 2, Filename: "b002-...dump", SizeBytes: 200, Timestamp: time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC)},
+	}
+
+	rows := mergeBackupListing(files, nil)
+
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(rows))
+	}
+
+	for _, r := range rows {
+		if r.Status != "complete" {
+			t.Errorf("ID %d: status=%q, want complete", r.ID, r.Status)
+		}
+	}
+}
+
+func TestMergeBackupListing_RunningContainerNoFile(t *testing.T) {
+	containers := []backupContainer{
+		{ID: 8, State: "running", ExitCode: 0},
+	}
+
+	rows := mergeBackupListing(nil, containers)
+
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+
+	if rows[0].Status != "running" || rows[0].ID != 8 {
+		t.Errorf("got %+v, want {ID: 8, Status: running}", rows[0])
+	}
+}
+
+func TestMergeBackupListing_RunningContainerWithGrowingFile(t *testing.T) {
+	// Container running while file grows — status is "running"
+	// even though the file is partially written.
+	files := []backupEntry{
+		{ID: 8, Filename: "b008-...dump", SizeBytes: 87 * 1024 * 1024},
+	}
+	containers := []backupContainer{
+		{ID: 8, State: "running", ExitCode: 0},
+	}
+
+	rows := mergeBackupListing(files, containers)
+
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+
+	if rows[0].Status != "running" {
+		t.Errorf("running container should override 'complete' status, got %q", rows[0].Status)
+	}
+
+	if rows[0].SizeBytes != 87*1024*1024 {
+		t.Errorf("file metadata should still surface, got size=%d", rows[0].SizeBytes)
+	}
+}
+
+func TestMergeBackupListing_FailedContainerNoFile(t *testing.T) {
+	// pg_dump failed; wrapper removed the partial file. Container
+	// is still around. List shows 'failed' status.
+	containers := []backupContainer{
+		{ID: 5, State: "exited", ExitCode: 1},
+	}
+
+	rows := mergeBackupListing(nil, containers)
+
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+
+	if rows[0].Status != "failed" {
+		t.Errorf("exit-non-zero should be 'failed', got %q", rows[0].Status)
+	}
+}
+
+func TestMergeBackupListing_ExitedZeroIsCompleteIfFile(t *testing.T) {
+	// Cleanly-exited container + file present = complete.
+	files := []backupEntry{
+		{ID: 3, Filename: "b003-...dump", SizeBytes: 1234},
+	}
+	containers := []backupContainer{
+		{ID: 3, State: "exited", ExitCode: 0},
+	}
+
+	rows := mergeBackupListing(files, containers)
+
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+
+	if rows[0].Status != "complete" {
+		t.Errorf("exit-zero with file should be 'complete', got %q", rows[0].Status)
+	}
+}
+
+func TestMergeBackupListing_SortedByID(t *testing.T) {
+	files := []backupEntry{
+		{ID: 5, Filename: "b005-...dump"},
+		{ID: 1, Filename: "b001-...dump"},
+	}
+	containers := []backupContainer{
+		{ID: 8, State: "running"},
+	}
+
+	rows := mergeBackupListing(files, containers)
+
+	want := []int{1, 5, 8}
+	if len(rows) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(rows))
+	}
+
+	for i, w := range want {
+		if rows[i].ID != w {
+			t.Errorf("rows[%d].ID = %d, want %d", i, rows[i].ID, w)
+		}
+	}
+}
+
+func TestParseFollowFlag(t *testing.T) {
+	cases := []struct {
+		args        []string
+		wantPos     []string
+		wantFollow  bool
+	}{
+		{[]string{"ref", "b001"}, []string{"ref", "b001"}, false},
+		{[]string{"ref", "b001", "--follow"}, []string{"ref", "b001"}, true},
+		{[]string{"ref", "b001", "-f"}, []string{"ref", "b001"}, true},
+		{[]string{"--follow", "ref", "b001"}, []string{"ref", "b001"}, true},
+	}
+
+	for _, tc := range cases {
+		pos, follow := parseFollowFlag(tc.args)
+
+		if follow != tc.wantFollow {
+			t.Errorf("parseFollowFlag(%v): follow=%v, want %v", tc.args, follow, tc.wantFollow)
+		}
+
+		if len(pos) != len(tc.wantPos) {
+			t.Errorf("parseFollowFlag(%v): pos=%v, want %v", tc.args, pos, tc.wantPos)
 		}
 	}
 }

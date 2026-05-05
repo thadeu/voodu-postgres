@@ -32,13 +32,14 @@ COMMANDS
   promote           promote a standby to primary (plugin runs pg_promote)
   rejoin            re-attach a divergent pod as standby (post-promote recovery)
   psql              interactive psql against the cluster (no password needed)
-  backups            list backups (Heroku-style; pg_dump-based)
-  backups:capture    take a fresh pg_dump snapshot
+  backups            list backups + status (running/complete/failed)
+  backups:capture    spawn pg_dump in a sibling container (detached default; --follow to stream)
+  backups:logs       docker logs on a backup container (--follow to tail)
   backups:restore    pg_restore from a local id or http(s) url (DESTRUCTIVE of db content)
   backups:download   copy a backup file from the pod to the host
   backups:delete     remove a backup file
   backups:schedule   print a cronjob HCL template for paste-and-apply
-  backups:cancel     terminate any pg_dump or pg_restore in progress
+  backups:cancel     docker stop a running capture (or all of them)
   backup             (legacy) pg_basebackup snapshot to a tar file
   restore            (legacy) restore PGDATA from a pg_basebackup tar (DESTRUCTIVE of cluster)
   help               this text

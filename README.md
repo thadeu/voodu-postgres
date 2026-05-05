@@ -419,43 +419,85 @@ sudo mkdir -p /opt/voodu/backups/clowk-lp/db
 
 #### Capture a snapshot
 
+`pg:backups:capture` is **detached by default** — it spawns a sibling Docker container that runs `pg_dump` and returns the new backup ID immediately. The dump survives SSH drops, terminal closure, and Ctrl-C of the `vd` command.
+
 ```bash
-# From primary (default)
+# Default: detached, returns ID immediately
 vd pg:backups:capture clowk-lp/db
+# postgres clowk-lp/db: backup b008 capturing in background (container clowk-lp-db-backup-b008, source: ordinal 0). track via: vd pg:backups clowk-lp/db  |  vd pg:backups:logs clowk-lp/db b008 --follow
+
+# Foreground with rolling progress
+vd pg:backups:capture clowk-lp/db --follow
+
+# From a standby (offloads work) + follow
+vd pg:backups:capture clowk-lp/db --from-replica 1 --follow
 ```
 
-Output during the dump (rolling progress line every ~3s on stderr):
+Output with `--follow`:
 
 ```
-capture: pg_dump in clowk-lp-db.0 → /backups/b001-20260505T020000Z.dump (db=postgres, user=postgres; raw size 487 MB, estimated dump ~243 MB)
+capture: pg_dump → /backups/b008-20260505T143000Z.dump (db=postgres, user=postgres; raw size 487 MB, estimated dump ~243 MB, container clowk-lp-db-backup-b008)
   [3s] 12.0 MB written (~5% of estimate)
   [10s] 68.0 MB written (~28% of estimate)
   [25s] 156.0 MB written (~64% of estimate)
   [45s] 218.0 MB written (~90% of estimate)
 done: 251.3 MB in 52s
-postgres clowk-lp/db: backup b001 captured (b001-20260505T020000Z.dump, 251.3 MB, source: ordinal 0, elapsed 52s)
+postgres clowk-lp/db: backup b008 captured (b008-20260505T143000Z.dump, 251.3 MB, source: ordinal 0, elapsed 52s)
 ```
 
-The `% of estimate` is a **hint, not a real percent**. pg_dump doesn't expose a true progress signal — the plugin queries `pg_database_size()` upfront and assumes ~50% compression (varies wildly with data shape). When the estimate is clearly wrong (>200% of estimate), the suffix is dropped silently and you just see bytes-written + elapsed. The trustworthy numbers are `<X> MB written` and `[<elapsed>s]`.
+The `% of estimate` is a **hint, not a real percent**. pg_dump doesn't expose a true progress signal — the plugin queries `pg_database_size()` upfront and assumes ~50% compression (varies wildly with data shape). When the estimate is clearly wrong (>200%), the suffix is dropped silently and you just see bytes-written + elapsed. The trustworthy numbers are `<X> MB written` and `[<elapsed>s]`.
 
-```bash
-# From a standby (offloads work)
-vd pg:backups:capture clowk-lp/db --from-replica 1
-```
+#### Container shape (capture internals)
 
-#### List
+Each capture spawns a one-shot container named `<scope>-<name>-backup-bNNN` that:
+
+- Reuses the source pod's image (so `pg_dump` is available)
+- Shares the source pod's network namespace via `--network container:<source>` (postgres reachable at `127.0.0.1`)
+- Bind-mounts the same `/opt/voodu/backups/<scope>/<name>` host path at `/backups`
+- Runs `pg_dump -F c -Z 6 -f /backups/<file>`; on non-zero exit, removes the partial file
+
+Auto-prune: each `:capture` removes any **exited** sibling backup containers from prior runs (free up the bNNN slot for re-use after `:delete`). Running ones are never touched — concurrent captures with different IDs work fine.
+
+> **Roadmap:** Once the controller exposes a runtime-dispatch action (`apply_manifest`), capture will migrate internally to emit a voodu `job` manifest instead of running `docker run` directly. UX stays identical; plumbing gets cleaner. See [the controller proposal](#) for status.
+
+#### List (with status)
 
 ```bash
 vd pg:backups clowk-lp/db
 # === Backups for clowk-lp/db
 #
-#   ID     Created at            Size
-#   b001   2026-05-04T02:00:00Z  245.3 MB
-#   b002   2026-05-05T02:00:00Z  248.1 MB
+#   ID     Status     Created at            Size
+#   b007   complete   2026-05-04T02:00:00Z  245.3 MB
+#   b008   running    2026-05-05T14:30:00Z  87.0 MB
 
 # JSON for jq pipelines
-vd pg:backups clowk-lp/db -o json | jq '.backups[] | {id, size_bytes}'
+vd pg:backups clowk-lp/db -o json | jq '.backups[] | {id, status, size_bytes}'
 ```
+
+The list merges two data sources:
+
+- **Files** in `/opt/voodu/backups/<scope>/<name>/` (read via host bind-mount — works without a running pod) → `complete` captures.
+- **Backup containers** matched via `docker ps -a --filter name=<scope>-<name>-backup-` → in-progress (`running`) and recently-failed (`failed`).
+
+Status reflects which side a given `bNNN` appears on:
+
+| Status | Container | File | Meaning |
+|---|---|---|---|
+| `running` | running | partial / absent | capture in flight |
+| `complete` | exited 0 (or pruned) | present | done, restorable |
+| `failed` | exited != 0 | absent (wrapper removed) | needs investigation via `pg:backups:logs` |
+
+#### Stream live logs
+
+```bash
+# One-shot read of accumulated container output
+vd pg:backups:logs clowk-lp/db b008
+
+# Tail in real-time (blocks until the container exits)
+vd pg:backups:logs clowk-lp/db b008 --follow
+```
+
+Wraps `docker logs [-f] <scope>-<name>-backup-bNNN`. Works for `running`, `complete`, and `failed` captures — until the next `:capture` auto-prunes exited siblings.
 
 #### Restore from a backup
 
@@ -529,18 +571,20 @@ cronjob "clowk-lp" "db-backup" {
 
 Combine with off-host sync (rclone, aws s3 sync, rsync) in a sibling cronjob mounting the same host path read-only.
 
-#### Cancel an in-progress capture or restore
+#### Cancel an in-progress capture
 
 ```bash
+# Stop everything in flight for clowk-lp/db
 vd pg:backups:cancel clowk-lp/db
-# postgres clowk-lp/db: terminated 1 backup-related connection(s)
+# postgres clowk-lp/db: stopped 1 capture
+
+# Stop a specific capture
+vd pg:backups:cancel clowk-lp/db b008
 ```
 
-Queries `pg_stat_activity` for connections whose `application_name` is `pg_dump` or `pg_restore` and runs `pg_terminate_backend(pid)` on each. Postgres handles the cleanup — no PID files, no host-side signal plumbing. The cluster is unaffected; only the named connection closes.
+Runs `docker stop` on the matching `<scope>-<name>-backup-bNNN` containers. The container's `pg_dump` receives SIGTERM (10s grace), then SIGKILL. Postgres detects the dropped connection and rolls back — non-destructive of the cluster.
 
-Useful when:
-- A capture is taking too long and you want to free up the source pod.
-- A restore needs to be aborted before it finishes drop+recreating objects. **Note**: a partial restore leaves the database in an inconsistent state — operator must follow up with a fresh restore from a known-good backup.
+The container's wrapper script removes the partial dump file on non-zero exit, so a cancelled capture leaves no garbage in `/backups/`.
 
 #### Off-site durability
 
@@ -725,13 +769,14 @@ vd postgres:unexpose clowk-lp/db
 | `vd postgres:promote <postgres> --replica <N> [--force] [--no-restart]` | Promote a standby to primary (plugin runs `pg_promote()` internally; refuses on lag without `--force`) |
 | `vd postgres:rejoin <postgres> --replica <N>` | Re-attach a divergent pod as standby via `pg_rewind` |
 | `vd postgres:psql <postgres> [--replica N] [-c "<sql>"]` | Drop into psql against the cluster (no password needed) |
-| `vd pg:backups <postgres> [-o json]` | List backups (Heroku-style; reads `/backups/`) |
-| `vd pg:backups:capture <postgres> [--from-replica N]` | Take a fresh `pg_dump` snapshot |
+| `vd pg:backups <postgres> [-o json]` | List backups + status (running/complete/failed) |
+| `vd pg:backups:capture <postgres> [--from-replica N] [--follow]` | Spawn pg_dump in a sibling container (detached default) |
+| `vd pg:backups:logs <postgres> <id> [--follow]` | docker logs on a backup container |
 | `vd pg:backups:restore <postgres> <id\|url> --yes` | `pg_restore` from local id or http(s) URL (DESTRUCTIVE of db content) |
 | `vd pg:backups:download <postgres> <id> [--to <path>]` | Copy a backup file from the pod to the host |
 | `vd pg:backups:delete <postgres> <id> --yes` | Remove a backup file from `/backups/` |
 | `vd pg:backups:schedule <postgres> [--at <cron>] [--from-replica N]` | Print cronjob HCL template for paste-and-apply |
-| `vd pg:backups:cancel <postgres>` | Terminate any `pg_dump` or `pg_restore` in progress |
+| `vd pg:backups:cancel <postgres> [<id>]` | docker stop running capture(s) |
 | `vd postgres:backup <postgres> --destination <path> [--from-replica N]` | (legacy) `pg_basebackup` snapshot to a tar file |
 | `vd postgres:restore <postgres> --from <path> --yes` | (legacy) Restore PGDATA from a tar (DESTRUCTIVE of cluster) |
 | `vd postgres:help` | Plugin overview |
