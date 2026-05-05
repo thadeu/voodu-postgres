@@ -44,8 +44,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
-	"syscall"
 )
 
 const psqlHelp = `vd postgres:psql — drop into psql against the cluster.
@@ -167,30 +165,35 @@ func cmdPsql() error {
 			containerName, refOrName(scope, name))
 	}
 
-	// Compose docker exec argv. -i + -t for interactive REPL;
-	// docker tolerates -t even when stdin isn't a TTY (useful
-	// for piped invocations like `... | tail`), so we always
-	// pass both.
-	dockerArgs := []string{
+	// Compose docker exec argv. -i + -t for interactive REPL.
+	// We hand this to the controller via an `exec_local`
+	// dispatch action — the controller passes it through to the
+	// CLI, which runs it locally with the operator's TTY
+	// attached. (syscall.Exec'ing docker from inside the plugin
+	// process doesn't work because plugin's stdio is the HTTP
+	// dispatch envelope, not the operator's terminal.)
+	command := []string{
 		"docker", "exec", "-it",
 		containerName,
 		"psql", "-U", user, "-d", db,
 	}
 
-	dockerArgs = append(dockerArgs, psqlArgs...)
+	command = append(command, psqlArgs...)
 
-	dockerBin, err := exec.LookPath("docker")
-	if err != nil {
-		return fmt.Errorf("docker not found in PATH: %w", err)
+	out := dispatchOutput{
+		Message: fmt.Sprintf("postgres %s: opening psql in %s (user=%s, db=%s)",
+			refOrName(scope, name), containerName, user, db),
+		Actions: []dispatchAction{
+			{
+				Type:    "exec_local",
+				Scope:   scope,
+				Name:    name,
+				Command: command,
+			},
+		},
 	}
 
-	// syscall.Exec replaces the plugin process with docker —
-	// stdin/stdout/stderr connect directly to the operator's
-	// terminal. No JSON envelope returned. The dispatch wrapper
-	// upstream sees the plugin exit and degrades gracefully
-	// (no envelope to decode → silent success/error from the
-	// docker exit code).
-	return syscall.Exec(dockerBin, dockerArgs, os.Environ())
+	return writeDispatchOutput(out)
 }
 
 // parsePsqlFlags pulls --replica and the `--` passthrough boundary

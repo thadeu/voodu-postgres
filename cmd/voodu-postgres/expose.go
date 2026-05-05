@@ -35,6 +35,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
 )
 
 const exposeFlagKey = "PG_EXPOSE_PUBLIC"
@@ -117,7 +118,9 @@ NOTES
     force them to reconnect via the new bind.
 `
 
-// cmdExpose flips PG_EXPOSE_PUBLIC=true on the bucket.
+// cmdExpose flips ports to 0.0.0.0 binding via apply_manifest +
+// persists the toggle in the config bucket so subsequent
+// vd apply runs preserve the exposed state.
 func cmdExpose() error {
 	args := os.Args[2:]
 
@@ -135,22 +138,23 @@ func cmdExpose() error {
 		return fmt.Errorf("invalid ref %q (expected scope/name)", args[0])
 	}
 
+	actions, err := composeExposeActions(scope, name, true)
+	if err != nil {
+		return err
+	}
+
 	out := dispatchOutput{
-		Message: fmt.Sprintf("postgres %s now exposed on 0.0.0.0:<port> — pod restart triggered. "+
+		Message: fmt.Sprintf("postgres %s now exposed on 0.0.0.0:<port> — container will be recreated. "+
 			"Reminder: rotate password (vd postgres:new-password %s) if it ever leaked anywhere untrusted.",
 			refOrName(scope, name), refOrName(scope, name)),
-		Actions: []dispatchAction{{
-			Type:  "config_set",
-			Scope: scope,
-			Name:  name,
-			KV:    map[string]string{exposeFlagKey: "true"},
-		}},
+		Actions: actions,
 	}
 
 	return writeDispatchOutput(out)
 }
 
-// cmdUnexpose unsets PG_EXPOSE_PUBLIC on the bucket.
+// cmdUnexpose flips ports back to loopback binding via
+// apply_manifest + clears PG_EXPOSE_PUBLIC from the bucket.
 func cmdUnexpose() error {
 	args := os.Args[2:]
 
@@ -168,16 +172,99 @@ func cmdUnexpose() error {
 		return fmt.Errorf("invalid ref %q (expected scope/name)", args[0])
 	}
 
+	actions, err := composeExposeActions(scope, name, false)
+	if err != nil {
+		return err
+	}
+
 	out := dispatchOutput{
-		Message: fmt.Sprintf("postgres %s back to loopback (127.0.0.1:<port>) — pod restart triggered",
+		Message: fmt.Sprintf("postgres %s back to loopback (127.0.0.1:<port>) — container will be recreated",
 			refOrName(scope, name)),
-		Actions: []dispatchAction{{
-			Type:  "config_unset",
-			Scope: scope,
-			Name:  name,
-			Keys:  []string{exposeFlagKey},
-		}},
+		Actions: actions,
 	}
 
 	return writeDispatchOutput(out)
+}
+
+// composeExposeActions assembles the action pair both cmdExpose
+// and cmdUnexpose emit:
+//
+//  1. config_set / config_unset on PG_EXPOSE_PUBLIC — persistent
+//     state so the next `vd apply` (operator HCL re-expand) keeps
+//     the exposed/loopback choice. SkipRestart=true to avoid the
+//     legacy fanout (which only re-Puts the manifest unchanged
+//     and doesn't actually flip ports — the historical bug this
+//     refactor fixes).
+//
+//  2. apply_manifest with the current statefulset spec, ports
+//     mutated to "0.0.0.0:<port>" (expose) or "<port>" (unexpose).
+//     Reconciler sees the spec change and recreates the container
+//     with the new bind address. THIS is what actually flips the
+//     port mapping.
+//
+// Why both: config bucket is the source of truth for cmdExpand
+// (preserves state across applies); apply_manifest is the
+// imperative path that takes effect immediately without waiting
+// for a re-apply.
+func composeExposeActions(scope, name string, exposed bool) ([]dispatchAction, error) {
+	ctx, err := readInvocationContext()
+	if err != nil {
+		return nil, err
+	}
+
+	if ctx.ControllerURL == "" {
+		return nil, fmt.Errorf("expose/unexpose requires controller_url (needs to read current statefulset spec)")
+	}
+
+	client := newControllerClient(ctx.ControllerURL)
+
+	spec, err := client.fetchSpec("statefulset", scope, name)
+	if err != nil {
+		return nil, fmt.Errorf("describe %s: %w", refOrName(scope, name), err)
+	}
+
+	port := readPortInt(spec)
+	if port == 0 {
+		port = 5432
+	}
+
+	portStr := strconv.Itoa(port)
+	if exposed {
+		portStr = "0.0.0.0:" + portStr
+	}
+
+	spec["ports"] = []any{portStr}
+
+	bucketAction := dispatchAction{
+		Type:        "config_set",
+		Scope:       scope,
+		Name:        name,
+		KV:          map[string]string{exposeFlagKey: "true"},
+		SkipRestart: true,
+	}
+
+	if !exposed {
+		bucketAction = dispatchAction{
+			Type:        "config_unset",
+			Scope:       scope,
+			Name:        name,
+			Keys:        []string{exposeFlagKey},
+			SkipRestart: true,
+		}
+	}
+
+	return []dispatchAction{
+		bucketAction,
+		{
+			Type:  "apply_manifest",
+			Scope: scope,
+			Name:  name,
+			Manifest: &dispatchManifest{
+				Kind:  "statefulset",
+				Scope: scope,
+				Name:  name,
+				Spec:  spec,
+			},
+		},
+	}, nil
 }

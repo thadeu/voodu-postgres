@@ -132,6 +132,13 @@ type dispatchAction struct {
 	// come from the top-level fields above. Empty for other
 	// action types.
 	Kind string `json:"kind,omitempty"`
+
+	// Command carries the exec_local payload — a vector the
+	// CLI runs locally on the operator's host with TTY attached.
+	// Used by interactive shells (cmdPsql) and any flow that
+	// needs the operator's terminal. Controller passes this
+	// through verbatim; it does not execute server-side.
+	Command []string `json:"command,omitempty"`
 }
 
 // dispatchManifest is the wire shape for apply_manifest payloads.
