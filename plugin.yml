@@ -1,6 +1,6 @@
 name: postgres
 aliases: [pg]
-version: 0.10.2
+version: 0.10.3
 description: >
   Voodu plugin for postgres clusters. Single primary + N standbys
   via streaming replication, WAL archive (local default,
@@ -17,6 +17,11 @@ homepage: https://github.com/thadeu/voodu-postgres
 entrypoint: bin/voodu-postgres
 
 commands:
+  - name: help
+    help: >
+      Plugin overview — what's available, sample HCL, common
+      flows. Same content as `vd postgres -h`.
+
   - name: expand
     help: >
       (Internal.) Macro entrypoint invoked by the controller
