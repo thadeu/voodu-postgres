@@ -50,43 +50,50 @@ func TestRenderEntrypointScript_PGDATADefault(t *testing.T) {
 	}
 }
 
-func TestRenderEntrypointScript_IdempotentIncludeDir(t *testing.T) {
+func TestRenderEntrypointScript_IdempotentAbsoluteIncludeDir(t *testing.T) {
+	// Includes via ABSOLUTE path /etc/postgresql/conf.d so PGDATA
+	// chown -R doesn't follow symlinks into read-only bind-mounts.
 	// grep -q before append so re-runs don't accumulate include_dir
-	// lines. Matches voodu-redis's "always-rewrite-bootstrap +
-	// preserve discovered state" pattern.
+	// lines.
 	got := renderEntrypointScript()
 
-	if !strings.Contains(got, "grep -q \"^include_dir = 'conf.d'\"") {
+	if !strings.Contains(got, "grep -q \"^include_dir = '/etc/postgresql/conf.d'\"") {
 		t.Errorf("missing idempotency guard around include_dir append:\n%s", got)
 	}
 
-	if !strings.Contains(got, "include_dir = 'conf.d'") {
+	if !strings.Contains(got, "include_dir = '/etc/postgresql/conf.d'") {
 		t.Errorf("missing the include_dir directive itself:\n%s", got)
 	}
 }
 
-func TestRenderEntrypointScript_SymlinksAllVooduConfsViaGlob(t *testing.T) {
-	// M-P2 generalised the symlink step: instead of one fixed
-	// OVERRIDES_SRC, the wrapper loops over voodu-*.conf so any
-	// number of plugin-emitted .conf files (M-P2 wal_archive,
-	// future M-P3 streaming-replication, etc.) flow into
-	// PGDATA/conf.d/ without touching the wrapper.
-	//
-	// nullglob is essential so an empty match doesn't iterate
-	// over the literal pattern string and try to symlink a
-	// non-existent file.
+func TestRenderEntrypointScript_NoSymlinkDanceUnderPGDATA(t *testing.T) {
+	// Bind-mounts now land directly under /etc/postgresql/conf.d/
+	// (path outside PGDATA). Postgres reads them via the absolute
+	// include_dir. No symlinks created in PGDATA = no chown -R
+	// surprises across plugin upgrades, no dangling symlinks from
+	// dropped subsystems (e.g. WAL archive removal).
 	got := renderEntrypointScript()
 
-	if !strings.Contains(got, "for src in /etc/postgresql/voodu-*.conf") {
-		t.Errorf("missing glob loop over voodu-*.conf:\n%s", got)
+	if strings.Contains(got, "ln -sf") {
+		t.Errorf("entrypoint should not create symlinks in PGDATA anymore:\n%s", got)
 	}
 
-	if !strings.Contains(got, "shopt -s nullglob") {
-		t.Errorf("expected `shopt -s nullglob` so empty match is a no-op:\n%s", got)
+	if strings.Contains(got, `mkdir -p "$PGDATA/conf.d"`) {
+		t.Errorf("entrypoint should not create $PGDATA/conf.d/ — config lives at /etc/postgresql/conf.d:\n%s", got)
 	}
+}
 
-	if !strings.Contains(got, "ln -sf") {
-		t.Errorf("expected `ln -sf` to keep symlinks fresh each boot:\n%s", got)
+func TestRenderEntrypointScript_RemovesLegacyConfDFromPGDATA(t *testing.T) {
+	// Upgrade safety: prior plugin versions wrote symlinks to
+	// $PGDATA/conf.d/. Volume persists across pod restarts, so
+	// stale symlinks (some pointing to assets that no longer exist
+	// — e.g. voodu-00-wal-archive.conf after WAL archive removal)
+	// would crash chown -R inside the postgres docker-entrypoint.
+	// New entrypoint nukes the legacy dir on every boot.
+	got := renderEntrypointScript()
+
+	if !strings.Contains(got, `rm -rf "$PGDATA/conf.d"`) {
+		t.Errorf("missing legacy $PGDATA/conf.d cleanup:\n%s", got)
 	}
 }
 

@@ -65,7 +65,7 @@ const (
 	// cleanly. Adding a new plugin-side conf needs zero changes
 	// to the wrapper.
 	entrypointMountPath  = "/usr/local/bin/voodu-postgres-entrypoint"
-	pgOverridesMountPath = "/etc/postgresql/voodu-99-overrides.conf"
+	pgOverridesMountPath = "/etc/postgresql/conf.d/voodu-99-overrides.conf"
 )
 
 // renderEntrypointScript produces the bash wrapper bytes the asset
@@ -239,35 +239,53 @@ fi
 # to the official postgres entrypoint.
 
 # 1. Ensure include_dir is wired into the postgres-managed
-#    postgresql.conf. Skipped on first boot when the file doesn't
-#    exist yet (initdb hasn't run on primary; pg_basebackup
-#    populated PGDATA on standby — postgresql.conf inherited from
-#    primary already has the directive if a previous boot wired it).
+#    postgresql.conf. Absolute path — points OUTSIDE PGDATA so
+#    the asset bind-mounts (read-only) don't get touched by the
+#    official docker-entrypoint's chown -R on PGDATA.
+#
+#    Skipped on first boot when the file doesn't exist yet
+#    (initdb hasn't run on primary; pg_basebackup populated PGDATA
+#    on standby — postgresql.conf inherited from primary already
+#    has the directive if a previous boot wired it).
+#
 #    Idempotent — appended only once.
+#
+#    Cleanup: if a previous version of this entrypoint wrote
+#    'include_dir = ...conf.d...' (PGDATA-relative path), comment
+#    it out so we don't get duplicate parsing. Combined with the
+#    absolute path below, postgres reads only the new location.
 if [ -f "$PGDATA/postgresql.conf" ]; then
-    if ! grep -q "^include_dir = 'conf.d'" "$PGDATA/postgresql.conf"; then
-        log "wiring include_dir = 'conf.d' into postgresql.conf"
+    if grep -q "^include_dir = 'conf.d'$" "$PGDATA/postgresql.conf"; then
+        log "deprecating legacy include_dir = 'conf.d' (PGDATA-relative) — voodu-postgres now uses /etc/postgresql/conf.d"
+        sed -i "s|^include_dir = 'conf.d'$|# include_dir = 'conf.d'  # deprecated by voodu-postgres|" "$PGDATA/postgresql.conf"
+    fi
+
+    if ! grep -q "^include_dir = '/etc/postgresql/conf.d'" "$PGDATA/postgresql.conf"; then
+        log "wiring include_dir = '/etc/postgresql/conf.d' into postgresql.conf"
         {
             echo ""
-            echo "# Added by voodu-postgres — pulls in /etc/postgresql/voodu-*.conf"
-            echo "include_dir = 'conf.d'"
+            echo "# Added by voodu-postgres — picks up bind-mounted voodu-*.conf"
+            echo "include_dir = '/etc/postgresql/conf.d'"
         } >> "$PGDATA/postgresql.conf"
+    fi
+
+    # Remove stale symlinks from previous voodu-postgres versions
+    # that put them under PGDATA/conf.d/. They point to bind-mounts
+    # that may no longer exist (e.g. voodu-00-wal-archive.conf was
+    # dropped when WAL archive subsystem was removed). Even if they
+    # resolve, chown -R on PGDATA follows the symlinks and chokes
+    # on the read-only mount targets. Just nuke the dir.
+    if [ -d "$PGDATA/conf.d" ]; then
+        log "removing legacy $PGDATA/conf.d (config now lives at /etc/postgresql/conf.d)"
+        rm -rf "$PGDATA/conf.d"
     fi
 fi
 
-# 2. Symlink each plugin-side conf into PGDATA/conf.d/. Glob
-#    picks up M-P1 overrides + M-P2 wal_archive + M-P3 streaming
-#    + future plugin emits with no wrapper changes. Postgres
-#    reads include_dir alphabetically; operator overrides (99-)
-#    trump plugin defaults (00-, 50-) cleanly.
-mkdir -p "$PGDATA/conf.d"
-
-shopt -s nullglob
-for src in /etc/postgresql/voodu-*.conf; do
-    base=$(basename "$src")
-    ln -sf "$src" "$PGDATA/conf.d/$base"
-done
-shopt -u nullglob
+# 2. (Symlink dance removed.) Bind-mounts now land directly under
+#    /etc/postgresql/conf.d/, which postgres reads via the
+#    absolute include_dir set above. No PGDATA mutation = no
+#    chown -R surprises = no stale-symlink rot across plugin
+#    versions.
 
 # 3. Ensure /backups (host bind-mount for pg_dump output) is owned
 #    by postgres. Bind-mount of a fresh host dir lands as root:root

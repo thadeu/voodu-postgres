@@ -61,7 +61,7 @@ const (
 	// pg_config (99-). Operator overrides still win on conflict
 	// because their conf comes later in the include_dir scan.
 	streamingConfAssetKey  = "streaming_conf"
-	streamingConfMountPath = "/etc/postgresql/voodu-50-streaming.conf"
+	streamingConfMountPath = "/etc/postgresql/conf.d/voodu-50-streaming.conf"
 
 	// initReplicationAssetKey + mount path. Lands in
 	// /docker-entrypoint-initdb.d/ which the official postgres
