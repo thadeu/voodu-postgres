@@ -48,7 +48,6 @@ DISPLAYS
   - super_user, database, port
   - replication_user
   - passwords (redacted: first 8 chars + ...)
-  - wal_archive enabled/disabled + mount path
   - exposed (loopback vs 0.0.0.0)
   - linked consumers (refs that received DATABASE_URL via link)
 
@@ -128,12 +127,9 @@ type infoSnapshot struct {
 	Database        string   `json:"database"`
 	Port            int      `json:"port"`
 	ReplicationUser string   `json:"replication_user"`
-	PasswordRedacted        string   `json:"password_redacted"`
+	PasswordRedacted            string `json:"password_redacted"`
 	ReplicationPasswordRedacted string `json:"replication_password_redacted"`
-	WALArchiveEnabled     bool   `json:"wal_archive_enabled"`
-	WALArchiveStrategy    string `json:"wal_archive_strategy,omitempty"`
-	WALArchiveDestination string `json:"wal_archive_destination,omitempty"`
-	Exposed         bool     `json:"exposed"`
+	Exposed                     bool   `json:"exposed"`
 	BindAddress     string   `json:"bind_address"`
 	LinkedConsumers []string `json:"linked_consumers,omitempty"`
 }
@@ -188,44 +184,6 @@ func composeInfoSnapshot(scope, name string, spec map[string]any, config map[str
 		}
 
 		snap.StandbyFQDNs = append(snap.StandbyFQDNs, composePrimaryFQDN(scope, name, i))
-	}
-
-	// WAL archive detection: scan volumes for a bind-mount
-	// whose container target is "/wal-archive". Plugin always
-	// emits the asset bind for the .conf file; the EXTRA
-	// host-path bind only appears when wal_archive enabled +
-	// strategy = "local".
-	//
-	// Asset binds start with "${asset...}:"; host bind-mounts
-	// start with a plain absolute path "/...". When we find the
-	// host bind, the strategy is local and the host path is the
-	// destination.
-	//
-	// FUTURE: when s3/r2 strategies ship, detection branches on
-	// config bucket markers (e.g. PG_WAL_STRATEGY=s3 written by
-	// the plugin) instead of pure volume scan.
-	if vols, ok := spec["volumes"].([]any); ok {
-		for _, v := range vols {
-			s, ok := v.(string)
-			if !ok || !strings.HasPrefix(s, "/") {
-				continue
-			}
-
-			parts := strings.SplitN(s, ":", 3)
-			if len(parts) < 2 {
-				continue
-			}
-
-			hostPath, containerPath := parts[0], parts[1]
-			if containerPath != "/wal-archive" {
-				continue
-			}
-
-			snap.WALArchiveEnabled = true
-			snap.WALArchiveStrategy = "local"
-			snap.WALArchiveDestination = hostPath
-			break
-		}
 	}
 
 	return snap
@@ -293,13 +251,6 @@ func formatInfoText(s infoSnapshot) string {
 	b.WriteString(fmt.Sprintf("  replication     %s (password=%s)\n", s.ReplicationUser, s.ReplicationPasswordRedacted))
 
 	b.WriteString("\n")
-
-	walState := "disabled"
-	if s.WALArchiveEnabled {
-		walState = fmt.Sprintf("enabled (%s @ %s)", s.WALArchiveStrategy, s.WALArchiveDestination)
-	}
-
-	b.WriteString(fmt.Sprintf("  wal_archive     %s\n", walState))
 	b.WriteString(fmt.Sprintf("  bind            %s\n", s.BindAddress))
 
 	if len(s.LinkedConsumers) > 0 {

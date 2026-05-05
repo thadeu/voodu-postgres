@@ -269,7 +269,18 @@ for src in /etc/postgresql/voodu-*.conf; do
 done
 shopt -u nullglob
 
-# 3. Hand off to the official postgres entrypoint. It honours
+# 3. Ensure /backups (host bind-mount for pg_dump output) is owned
+#    by postgres. Bind-mount of a fresh host dir lands as root:root
+#    inside the container; pg_dump runs as postgres uid 999 and
+#    needs write access. Idempotent — chown is a no-op if perms
+#    already match. Skipped silently if /backups doesn't exist
+#    (operator overrode the bind-mount or pre-1.0 deploys).
+if [ -d /backups ]; then
+    chown postgres:postgres /backups 2>/dev/null || \
+        log "warn: could not chown /backups (continuing — pg_dump may fail with permission denied)"
+fi
+
+# 4. Hand off to the official postgres entrypoint. It honours
 #    POSTGRES_USER/PASSWORD/DB env vars to run initdb on first
 #    boot of the primary, wires pg_hba defaults, runs init
 #    scripts under /docker-entrypoint-initdb.d/, and execs

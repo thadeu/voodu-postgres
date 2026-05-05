@@ -114,7 +114,7 @@ type expandedPayload struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		emitErr("usage: voodu-postgres <expand|link|unlink|new-password|info|expose|unexpose|promote|rejoin|psql|backup|restore|defaults|help|--version>")
+		emitErr("usage: voodu-postgres <expand|link|unlink|new-password|info|expose|unexpose|promote|rejoin|psql|backup|restore|backups|backups:capture|backups:restore|backups:download|backups:delete|backups:schedule|backups:cancel|defaults|help|--version>")
 		os.Exit(1)
 	}
 
@@ -206,6 +206,58 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "backups":
+		// `vd pg:backups <ref>` — list backups (Heroku-style,
+		// no verb means default action = list).
+		if err := cmdBackups(); err != nil {
+			emitErr(err.Error())
+			os.Exit(1)
+		}
+
+	case "backups:capture":
+		// `vd pg:backups:capture <ref>` — pg_dump snapshot.
+		if err := cmdBackupsCapture(); err != nil {
+			emitErr(err.Error())
+			os.Exit(1)
+		}
+
+	case "backups:restore":
+		// `vd pg:backups:restore <ref> <id>` — pg_restore from /backups/<file>.
+		if err := cmdBackupsRestore(); err != nil {
+			emitErr(err.Error())
+			os.Exit(1)
+		}
+
+	case "backups:download":
+		// `vd pg:backups:download <ref> <id>` — docker cp to host.
+		if err := cmdBackupsDownload(); err != nil {
+			emitErr(err.Error())
+			os.Exit(1)
+		}
+
+	case "backups:delete":
+		// `vd pg:backups:delete <ref> <id>` — rm /backups/<file>.
+		if err := cmdBackupsDelete(); err != nil {
+			emitErr(err.Error())
+			os.Exit(1)
+		}
+
+	case "backups:schedule":
+		// `vd pg:backups:schedule <ref> --at <cron>` — print
+		// HCL template for an operator-declared cronjob.
+		if err := cmdBackupsSchedule(); err != nil {
+			emitErr(err.Error())
+			os.Exit(1)
+		}
+
+	case "backups:cancel":
+		// `vd pg:backups:cancel <ref>` — pg_terminate_backend on
+		// any pg_dump or pg_restore in progress.
+		if err := cmdBackupsCancel(); err != nil {
+			emitErr(err.Error())
+			os.Exit(1)
+		}
+
 	case "help":
 		// `vd postgres -h` reaches us as a "help" subcommand.
 		// Plain text on stdout (no envelope) — operator sees the
@@ -213,7 +265,7 @@ func main() {
 		printPluginOverview()
 
 	default:
-		emitErr(fmt.Sprintf("unknown subcommand %q (want expand|link|unlink|new-password|info|expose|unexpose|promote|rejoin|psql|backup|restore|defaults|help)", os.Args[1]))
+		emitErr(fmt.Sprintf("unknown subcommand %q (want expand|link|unlink|new-password|info|expose|unexpose|promote|rejoin|psql|backup|restore|backups|backups:capture|backups:restore|backups:download|backups:delete|backups:schedule|backups:cancel|defaults|help)", os.Args[1]))
 		os.Exit(1)
 	}
 }
@@ -276,29 +328,6 @@ func cmdExpand() error {
 		return fmt.Errorf("postgres %s: resolve replication password: %w", refOrName(req.Scope, req.Name), err)
 	}
 
-	// WAL archive defaults if operator omitted the block. nil
-	// would mean "explicit no" only after a future flag-flip
-	// codepath; today omission == "use defaults" == enabled.
-	walSpec := spec.WALArchive
-	if walSpec == nil {
-		walSpec = defaultWALArchiveSpec()
-	}
-
-	// Resolve the strategy + plan once. Plan is used by both
-	// renderWALArchiveConf (for archive_command) and
-	// composeStatefulsetDefaults (for volumes). Strategy was
-	// already validated by validatePostgresSpec above; this
-	// selectStrategy can't error.
-	walStrategy, err := selectStrategy(walSpec.Strategy)
-	if err != nil {
-		return fmt.Errorf("postgres %s: %w", refOrName(req.Scope, req.Name), err)
-	}
-
-	walPlan := walArchivePlan{}
-	if walSpec.Enabled {
-		walPlan = walStrategy.Apply(walSpec, req.Scope, req.Name)
-	}
-
 	// Primary ordinal: defaults to 0 (the convention is pod-0 =
 	// primary, pod-1+ = standbys). `vd postgres:promote --replica
 	// N` flips this via the PG_PRIMARY_ORDINAL bucket key — on the
@@ -315,7 +344,6 @@ func cmdExpand() error {
 
 	entrypointBytes := renderEntrypointScript()
 	overridesBytes := renderPgOverridesConf(spec.PgConfig)
-	walArchiveBytes := renderWALArchiveConf(walSpec, walPlan)
 	streamingBytes := renderStreamingConf(req.Scope, req.Name, primaryOrdinal, spec.ReplicationUser, replicationPassword)
 	initReplicationBytes := renderInitReplicationSH()
 
@@ -325,18 +353,17 @@ func cmdExpand() error {
 		Name:  req.Name,
 		Spec: map[string]any{
 			"files": map[string]any{
-				entrypointAssetKey:       entrypointBytes,
-				pgOverridesAssetKey:      overridesBytes,
-				walArchiveAssetKey:       walArchiveBytes,
-				streamingConfAssetKey:    streamingBytes,
-				initReplicationAssetKey:  initReplicationBytes,
+				entrypointAssetKey:      entrypointBytes,
+				pgOverridesAssetKey:     overridesBytes,
+				streamingConfAssetKey:   streamingBytes,
+				initReplicationAssetKey: initReplicationBytes,
 			},
 		},
 	}
 
 	exposed := req.Config[exposeFlagKey] == "true"
 
-	defaults := composeStatefulsetDefaults(req.Scope, req.Name, spec, password, replicationPassword, primaryOrdinal, walPlan, exposed)
+	defaults := composeStatefulsetDefaults(req.Scope, req.Name, spec, password, replicationPassword, primaryOrdinal, exposed)
 	merged := mergeSpec(defaults, operatorSpec)
 
 	stripPluginOwnedFields(merged)
@@ -428,7 +455,7 @@ func assetRef(scope, name, key string) string {
 // Readiness probes after first boot completes (initdb takes a few
 // seconds on a fresh volume; the controller's start-grace covers
 // the gap).
-func composeStatefulsetDefaults(scope, name string, spec *postgresSpec, password, replicationPassword string, primaryOrdinal int, walPlan walArchivePlan, exposed bool) map[string]any {
+func composeStatefulsetDefaults(scope, name string, spec *postgresSpec, password, replicationPassword string, primaryOrdinal int, exposed bool) map[string]any {
 	env := map[string]any{
 		// Official postgres image contract
 		"POSTGRES_USER":        spec.User,
@@ -466,6 +493,13 @@ func composeStatefulsetDefaults(scope, name string, spec *postgresSpec, password
 		assetRef(scope, name, pgOverridesAssetKey) + ":" + pgOverridesMountPath + ":ro",
 		assetRef(scope, name, streamingConfAssetKey) + ":" + streamingConfMountPath + ":ro",
 		assetRef(scope, name, initReplicationAssetKey) + ":" + initReplicationMountPath + ":ro",
+
+		// Backups directory: host bind-mount for pg_dump output.
+		// Same path on every pod (primary writes; replicas can
+		// mount + read for `vd pg:backups:capture --from-replica`).
+		// Operator pre-flight: `mkdir -p /opt/voodu/backups/<scope>/<name>`
+		// (chown handled by entrypoint wrapper at boot).
+		composeBackupHostPath(scope, name) + ":" + backupsContainerPath + ":rw",
 	}
 
 	volumeClaims := []any{
@@ -473,23 +507,6 @@ func composeStatefulsetDefaults(scope, name string, spec *postgresSpec, password
 			"name":       "data",
 			"mount_path": "/var/lib/postgresql/data",
 		},
-	}
-
-	// WAL archive: the asset bind for the .conf file is always
-	// emitted (header-only when disabled). When enabled, the
-	// strategy contributes its own volumes via walPlan:
-	//
-	//   - "local" strategy emits a host bind-mount at
-	//     /wal-archive (rw on every pod — see strategy_local.go
-	//     for the rationale on cluster-level WAL ownership).
-	//   - Future "s3"/"r2" strategies emit no volumes (writes
-	//     go via API/CLI without a mount).
-	volumes = append(volumes,
-		assetRef(scope, name, walArchiveAssetKey)+":"+walArchiveConfMountPath+":ro",
-	)
-
-	for _, vol := range walPlan.Volumes {
-		volumes = append(volumes, vol)
 	}
 
 	// Port binding: loopback by default (voodu's "ports are
@@ -731,11 +748,6 @@ func defaultsForInspection() map[string]any {
 		"pg_config":        map[string]any{},
 		"extensions":       []any{},
 		"replication_user": "replicator",
-		"wal_archive": map[string]any{
-			"enabled":     true,
-			"strategy":    "local",
-			"destination": "<auto: /opt/voodu/backups/<scope>/<name>>",
-		},
 	}
 }
 

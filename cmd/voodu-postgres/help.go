@@ -10,29 +10,38 @@ import "fmt"
 const pluginOverview = `vd postgres — managed postgres clusters on voodu
 
 A macro plugin that expands a postgres { } HCL block into:
-  - 1 asset (entrypoint script + 3 .conf files + 1 init script)
+  - 1 asset (entrypoint script + 2 .conf files + 1 init script)
   - 1 statefulset (the postgres pods themselves)
   - 1+ config_set actions (auto-gen passwords on first apply)
 
 Cluster shape: pod-0 = primary, pod-N+ = streaming-replication
-standbys via pg_basebackup. WAL archive ON by default to a
-sibling volume_claim. Operator points HCL at a custom image for
-extensions baked (pgvector, postgis).
+standbys via pg_basebackup. Backups are point-in-snapshot via
+pg_dump (vd pg:backups:capture) — no WAL archive, no PITR. Each
+pod bind-mounts /opt/voodu/backups/<scope>/<name> at /backups/.
+Operator points HCL at a custom image for extensions baked
+(pgvector, postgis).
 
 COMMANDS
-  expand          (internal) macro entrypoint, called by vd apply
-  link            wire DATABASE_URL into a consumer's bucket
-  unlink          remove a previously-set DATABASE_URL
-  new-password    rotate the superuser password + refresh consumers
-  info            show cluster topology, ports, linked consumers
-  expose          publish postgres on 0.0.0.0 (Internet-facing)
-  unexpose        return postgres to 127.0.0.1 (loopback only)
-  promote         promote a standby to primary (plugin runs pg_promote)
-  rejoin          re-attach a divergent pod as standby (post-promote recovery)
-  psql            interactive psql against the cluster (no password needed)
-  backup          pg_basebackup snapshot to a tar file
-  restore         restore from a tar (DESTRUCTIVE; supports PITR)
-  help            this text
+  expand            (internal) macro entrypoint, called by vd apply
+  link              wire DATABASE_URL into a consumer's bucket
+  unlink            remove a previously-set DATABASE_URL
+  new-password      rotate the superuser password + refresh consumers
+  info              show cluster topology, ports, linked consumers
+  expose            publish postgres on 0.0.0.0 (Internet-facing)
+  unexpose          return postgres to 127.0.0.1 (loopback only)
+  promote           promote a standby to primary (plugin runs pg_promote)
+  rejoin            re-attach a divergent pod as standby (post-promote recovery)
+  psql              interactive psql against the cluster (no password needed)
+  backups            list backups (Heroku-style; pg_dump-based)
+  backups:capture    take a fresh pg_dump snapshot
+  backups:restore    pg_restore from a local id or http(s) url (DESTRUCTIVE of db content)
+  backups:download   copy a backup file from the pod to the host
+  backups:delete     remove a backup file
+  backups:schedule   print a cronjob HCL template for paste-and-apply
+  backups:cancel     terminate any pg_dump or pg_restore in progress
+  backup             (legacy) pg_basebackup snapshot to a tar file
+  restore            (legacy) restore PGDATA from a pg_basebackup tar (DESTRUCTIVE of cluster)
+  help               this text
 
   Pass --help to any subcommand for full usage:
     vd postgres:link --help
@@ -92,13 +101,6 @@ HCL CONTRACT (minimal → comprehensive)
       max_connections      = 200
       shared_buffers       = "256MB"
       log_connections      = true
-    }
-
-    # WAL archive — built-in, defaults to local volume + retention
-    # via operator cronjob (see README).
-    wal_archive {
-      enabled    = true                 # default
-      mount_path = "/wal-archive"       # default
     }
 
     # Statefulset passthroughs — anything the statefulset accepts

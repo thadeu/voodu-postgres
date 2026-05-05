@@ -23,7 +23,7 @@ func TestComposeStatefulsetDefaults_PortsLoopbackByDefault(t *testing.T) {
 	// Default exposed=false → ports = ["5432"] (voodu's
 	// platform invariant prefixes 127.0.0.1 to bare port).
 	spec := mustParse(t, nil)
-	got := composeStatefulsetDefaults("s", "n", spec, "pw", "repl-pw", 0, testWALPlan("s", "n"), false)
+	got := composeStatefulsetDefaults("s", "n", spec, "pw", "repl-pw", 0, false)
 
 	ports, ok := got["ports"].([]any)
 	if !ok || len(ports) != 1 {
@@ -40,7 +40,7 @@ func TestComposeStatefulsetDefaults_PortsExposedFlipsTo0000(t *testing.T) {
 	// platform takes "0.0.0.0:" prefix verbatim and binds
 	// public.
 	spec := mustParse(t, nil)
-	got := composeStatefulsetDefaults("s", "n", spec, "pw", "repl-pw", 0, testWALPlan("s", "n"), true)
+	got := composeStatefulsetDefaults("s", "n", spec, "pw", "repl-pw", 0, true)
 
 	ports := got["ports"].([]any)
 
@@ -52,7 +52,7 @@ func TestComposeStatefulsetDefaults_PortsExposedFlipsTo0000(t *testing.T) {
 func TestComposeStatefulsetDefaults_ExposeHonoursCustomPort(t *testing.T) {
 	// Operator override `port = 5433` + expose flip → "0.0.0.0:5433".
 	spec := mustParse(t, map[string]any{"port": 5433})
-	got := composeStatefulsetDefaults("s", "n", spec, "pw", "repl-pw", 0, testWALPlan("s", "n"), true)
+	got := composeStatefulsetDefaults("s", "n", spec, "pw", "repl-pw", 0, true)
 
 	ports := got["ports"].([]any)
 

@@ -1,6 +1,6 @@
 # voodu-postgres
 
-Voodu plugin that expands a `postgres { … }` HCL block into a production-ready postgres cluster: 1 primary + N streaming-replication standbys, WAL archive on by default, auto-generated passwords, dual `DATABASE_URL` injection (writer + reader endpoints, RDS-style).
+Voodu plugin that expands a `postgres { … }` HCL block into a production-ready postgres cluster: 1 primary + N streaming-replication standbys, auto-generated passwords, dual `DATABASE_URL` injection (writer + reader endpoints, RDS-style).
 
 Bare block produces a single hardened primary; `replicas = 3` flips it into a cluster with `pg_basebackup`-cloned standbys and `primary_conninfo`-driven WAL streaming.
 
@@ -12,7 +12,6 @@ Bare block produces a single hardened primary; `replicas = 3` flips it into a cl
   - [Plugin defaults](#plugin-defaults)
   - [Customising postgresql.conf via `pg_config`](#customising-postgresqlconf-via-pg_config)
   - [Custom image (extensions baked)](#custom-image-extensions-baked)
-  - [WAL archive](#wal-archive)
   - [Statefulset passthrough](#statefulset-passthrough)
 - [High availability — streaming replication](#high-availability--streaming-replication)
   - [Cluster shape](#cluster-shape)
@@ -21,21 +20,13 @@ Bare block produces a single hardened primary; `replicas = 3` flips it into a cl
   - [Promote a standby](#promote-a-standby)
   - [Rejoining the old primary](#rejoining-the-old-primary)
 - [Backup automation](#backup-automation)
-  - [`vd postgres:backup`](#vd-postgresbackup)
-  - [`vd postgres:restore`](#vd-postgresrestore)
-  - [WAL cleanup pattern](#wal-cleanup-pattern)
-  - [Scheduled basebackups](#scheduled-basebackups)
-  - [Off-site WAL replication (S3 + R2 double durability)](#off-site-wal-replication-s3--r2-double-durability)
-  - [Alternative archive destinations](#alternative-archive-destinations)
-- [Disaster recovery](#disaster-recovery)
-  - [Restore from cloud archive](#restore-from-cloud-archive)
-  - [Recovery scenarios](#recovery-scenarios)
+  - [`vd pg:backups` (Heroku-style)](#vd-pgbackups-heroku-style-recommended)
+  - [`vd postgres:backup` / `vd postgres:restore` (legacy)](#vd-postgresbackup--vd-postgresrestore-legacy-pg_basebackup)
 - [Connecting via `psql`](#connecting-via-psql)
 - [Real-world examples](#real-world-examples)
   - [Single primary + Rails app](#single-primary--rails-app)
   - [3-replica cluster + Rails MultiDB](#3-replica-cluster--rails-multidb)
   - [Custom image with pgvector](#custom-image-with-pgvector)
-  - [WAL archive to S3 + R2 (multi-cloud durability)](#wal-archive-to-s3--r2-multi-cloud-durability)
   - [External access for DBeaver / TablePlus](#external-access-for-dbeaver--tableplus)
 - [Plugin reference](#plugin-reference)
   - [Commands](#commands)
@@ -68,8 +59,8 @@ vd apply -f voodu.hcl
 
 Plugin emits:
 
-- **`asset "clowk-lp" "db"`** — 5 files: bash entrypoint wrapper, postgresql.conf overrides, WAL archive defaults, streaming-replication conf, replication-user init script
-- **`statefulset "clowk-lp" "db"`** — 3 pods (`db-0..db-2`), 1 volume claim (`data`, per-pod) + 1 host bind-mount (`/opt/voodu/backups/clowk-lp/db` → `/wal-archive`, shared across pods), 5 asset bind-mounts, env vars wiring everything
+- **`asset "clowk-lp" "db"`** — 4 files: bash entrypoint wrapper, postgresql.conf overrides, streaming-replication conf, replication-user init script
+- **`statefulset "clowk-lp" "db"`** — 3 pods (`db-0..db-2`), 1 volume claim (`data`, per-pod), 4 asset bind-mounts, host bind-mount `/opt/voodu/backups/clowk-lp/db` → `/backups`, env vars wiring everything
 - **2 config_set actions** (first apply only) — persists auto-gen `POSTGRES_PASSWORD` + `POSTGRES_REPLICATION_PASSWORD`
 
 Wire your app:
@@ -116,13 +107,6 @@ postgres "scope" "name" {
     log_connections = true
   }
 
-  # WAL archive (on by default — see WAL section)
-  wal_archive = {
-    enabled     = true
-    strategy    = "local"                              # default
-    destination = "/opt/voodu/backups/clowk-lp/db"     # default for local
-  }
-
   # Extensions: parsed + validated, but NOT auto-installed (M-P4
   # ships `vd postgres:exec` for explicit install).
   extensions = ["pgvector", "pg_stat_statements"]
@@ -147,13 +131,13 @@ Bare block — `postgres "data" "db" {}` — emits a statefulset with:
 - `command = ["bash", "/usr/local/bin/voodu-postgres-entrypoint"]` (role-aware wrapper)
 - `ports = ["5432"]` (loopback by default — `vd postgres:expose` to publish)
 - `volume_claims`: `data` at `/var/lib/postgresql/data` (per-pod, statefulset-style)
-- `volumes`: host bind-mount `/opt/voodu/backups/<scope>/<name>` → `/wal-archive` (shared across pods, see [WAL archive](#wal-archive))
+- `volumes`: host bind-mount `/opt/voodu/backups/<scope>/<name>` → `/backups` (where `vd pg:backups:capture` writes)
 - `health_check = "pg_isready -U postgres -d postgres -p 5432"`
 - env: `POSTGRES_USER` / `POSTGRES_DB` / `POSTGRES_PASSWORD` / `POSTGRES_INITDB_ARGS` / `PGDATA` / `PG_PORT` / `PG_NAME` / `PG_SCOPE_SUFFIX` / `PG_PRIMARY_ORDINAL` / `PG_REPLICATION_USER` / `PG_REPLICATION_PASSWORD`
 
 ### Customising postgresql.conf via `pg_config`
 
-The `pg_config` map renders into a `voodu-99-overrides.conf` file that postgres loads via `include_dir`. "Last assignment wins" — operator overrides trump plugin defaults from `voodu-00-wal-archive.conf` and `voodu-50-streaming.conf`.
+The `pg_config` map renders into a `voodu-99-overrides.conf` file that postgres loads via `include_dir`. "Last assignment wins" — operator overrides trump plugin defaults from `voodu-50-streaming.conf`.
 
 ```hcl
 postgres "clowk-lp" "db" {
@@ -228,98 +212,6 @@ The same image must work as primary AND standby (standbys clone primary via `pg_
 
 Extensions: enable inside the database via your app's migration system (Rails `enable_extension :pgvector`, Django RunSQL, etc.) OR with a one-off `vd postgres:psql <ref> -c "CREATE EXTENSION IF NOT EXISTS pgvector"`.
 
-### WAL archive
-
-WAL archive is on by default. Plugin **bind-mounts a host directory** at `/wal-archive` inside every pod (NOT a per-pod volume_claim) and emits `voodu-00-wal-archive.conf` with:
-
-```ini
-wal_level       = replica
-archive_mode    = on
-archive_command = 'test ! -f /wal-archive/%f && cp %p /wal-archive/%f'
-archive_timeout = 60
-```
-
-The default `archive_command` writes locally with an idempotency guard (rejects rewrites that would corrupt the archive on retry). Operator overrides via `pg_config`:
-
-```hcl
-postgres "clowk-lp" "db" {
-  pg_config = {
-    archive_command = "aws s3 cp %p s3://my-bucket/wal/%f"
-  }
-
-  env_from = ["aws/cli"]   # AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY
-                           # via shared bucket pattern
-}
-```
-
-Disable entirely (no host bind-mount, no archive overhead):
-
-```hcl
-postgres "clowk-lp" "db" {
-  wal_archive = {
-    enabled = false
-  }
-}
-```
-
-#### Strategy + destination (single source of truth)
-
-The block has 3 fields:
-
-```hcl
-wal_archive = {
-  enabled     = true                                # default
-  strategy    = "local"                             # default — only one shipped today
-  destination = "/opt/voodu/backups/<scope>/<name>" # default for local
-}
-```
-
-| Field | What it does |
-|---|---|
-| `enabled` | toggle the whole subsystem |
-| `strategy` | picks how the WAL leaves the pod. Today: `"local"`. Future: `"s3"`, `"r2"`, `"nfs"`, `"rsync"` (each will live in `strategy_<name>.go`). |
-| `destination` | strategy-interpreted target. For `local`: an absolute host path. Future strategies use URI shapes (`s3://bucket/prefix`, etc.). |
-
-Why we picked this shape: `destination` is honest — it describes the WAL's destination regardless of medium. When S3/R2 ship later, the operator API stays identical (just flip `strategy`); no rename. The container mount path inside pods is fixed at `/wal-archive` for the local strategy — internal plumbing, not part of the operator surface.
-
-#### Local strategy — host bind-mount
-
-For `strategy = "local"` (default), plugin emits a bind-mount of `destination` (host path) → `/wal-archive` (container path) on EVERY pod, NOT a per-pod docker volume.
-
-Why bind-mount instead of `volume_claim`: WAL archive is **cluster-level state**, not pod-level. After a `vd pg:promote --replica 1` failover, pod-1 (new primary) needs to keep writing to the SAME archive directory pod-0 was writing to — otherwise PITR has a gap (old primary's WAL stranded on a different volume). Per-pod volumes orphan WAL on failover; a single host bind-mount preserves continuity.
-
-All pods (primary + standbys) mount `:rw`. In practice only the primary writes (postgres `archive_command` only fires on the primary), but the `:rw` mount means any standby promoted later continues writing transparently — no remount cycle.
-
-#### Pre-flight: create the host directory (local strategy only)
-
-Plugin does NOT create the directory automatically (would require privileged host access at apply time). Operator runs once before the first apply:
-
-```bash
-sudo mkdir -p /opt/voodu/backups/clowk-lp/db
-sudo chown 999:999 /opt/voodu/backups/clowk-lp/db    # postgres user UID/GID inside the container
-sudo chmod 0700 /opt/voodu/backups/clowk-lp/db       # WAL is sensitive — no world read
-```
-
-If the path is missing or has wrong ownership, postgres' `archive_command` fails per WAL switch (visible in `vd logs clowk-lp/db | grep archive`) and WAL accumulates in the data dir until disk is full.
-
-#### Custom `destination`
-
-Override when you want a different location (NFS mount, dedicated SSD, etc.):
-
-```hcl
-postgres "clowk-lp" "db" {
-  wal_archive = {
-    enabled     = true
-    strategy    = "local"
-    destination = "/mnt/nfs-backup/postgres/clowk-lp-db"
-  }
-}
-```
-
-The validator rejects `destination` under known dangerous roots (`/etc`, `/usr`, `/proc`, etc.) at apply time — operator typo doesn't bind-mount postgres on top of system files.
-
-**Cleanup is operator-owned** — see [Backup automation](#backup-automation) below.
-
 ### Statefulset passthrough
 
 Anything the statefulset kind accepts flows through unchanged. Common cases:
@@ -353,7 +245,7 @@ postgres "clowk-lp" "db" {
 }
 ```
 
-Plugin-owned fields (`database`, `user`, `password`, `port`, `initdb_locale`, `initdb_encoding`, `pg_config`, `extensions`, `wal_archive`, `replication_user`) are stripped from the merged spec before emitting — they don't leak to the statefulset wire shape.
+Plugin-owned fields (`database`, `user`, `password`, `port`, `initdb_locale`, `initdb_encoding`, `pg_config`, `extensions`, `replication_user`) are stripped from the merged spec before emitting — they don't leak to the statefulset wire shape.
 
 #### Resource limits
 
@@ -412,8 +304,6 @@ Produces 3 pods with stable identity:
 | `clowk-lp-db.0` | primary | `db-0.clowk-lp.voodu` | `voodu-clowk-lp-db-data-0` |
 | `clowk-lp-db.1` | standby | `db-1.clowk-lp.voodu` | `voodu-clowk-lp-db-data-1` |
 | `clowk-lp-db.2` | standby | `db-2.clowk-lp.voodu` | `voodu-clowk-lp-db-data-2` |
-
-WAL archive lives on a **shared host bind-mount** — `/opt/voodu/backups/clowk-lp/db` → `/wal-archive` on every pod. Primary writes via `archive_command`; standbys mount it `:rw` so a promoted-to-primary standby can keep writing without a re-mount. See [WAL archive](#wal-archive) for why this is shared and not per-pod.
 
 Plus the round-robin shared alias `db.clowk-lp.voodu` resolving to all 3 pods (use sparingly — primary writes need pod-0 specifically).
 
@@ -516,389 +406,172 @@ The wrapper script's split-brain guard prevents accidental writes during this wi
 
 ## Backup automation
 
-### `vd postgres:backup`
+### `vd pg:backups` (Heroku-style, recommended)
 
-`pg_basebackup` snapshot to a tar file. Plugin spawns a one-shot container that shares the source pod's network namespace (`db-N.scope.voodu` resolves via voodu0 DNS) and streams the backup to the operator-supplied destination path on the host:
+`pg_dump` snapshots managed by the plugin. The host directory `/opt/voodu/backups/<scope>/<name>/` is bind-mounted at `/backups` inside every pod; backup files live there as `bNNN-<timestamp>.dump` (custom format, restorable via `pg_restore`).
+
+#### Pre-flight (once per host)
 
 ```bash
-# Default: backup from the current primary
+sudo mkdir -p /opt/voodu/backups/clowk-lp/db
+# chown is handled by the entrypoint wrapper at boot — no manual chown needed
+```
+
+#### Capture a snapshot
+
+```bash
+# From primary (default)
+vd pg:backups:capture clowk-lp/db
+```
+
+Output during the dump (rolling progress line every ~3s on stderr):
+
+```
+capture: pg_dump in clowk-lp-db.0 → /backups/b001-20260505T020000Z.dump (db=postgres, user=postgres; raw size 487 MB, estimated dump ~243 MB)
+  [3s] 12.0 MB written (~5% of estimate)
+  [10s] 68.0 MB written (~28% of estimate)
+  [25s] 156.0 MB written (~64% of estimate)
+  [45s] 218.0 MB written (~90% of estimate)
+done: 251.3 MB in 52s
+postgres clowk-lp/db: backup b001 captured (b001-20260505T020000Z.dump, 251.3 MB, source: ordinal 0, elapsed 52s)
+```
+
+The `% of estimate` is a **hint, not a real percent**. pg_dump doesn't expose a true progress signal — the plugin queries `pg_database_size()` upfront and assumes ~50% compression (varies wildly with data shape). When the estimate is clearly wrong (>200% of estimate), the suffix is dropped silently and you just see bytes-written + elapsed. The trustworthy numbers are `<X> MB written` and `[<elapsed>s]`.
+
+```bash
+# From a standby (offloads work)
+vd pg:backups:capture clowk-lp/db --from-replica 1
+```
+
+#### List
+
+```bash
+vd pg:backups clowk-lp/db
+# === Backups for clowk-lp/db
+#
+#   ID     Created at            Size
+#   b001   2026-05-04T02:00:00Z  245.3 MB
+#   b002   2026-05-05T02:00:00Z  248.1 MB
+
+# JSON for jq pipelines
+vd pg:backups clowk-lp/db -o json | jq '.backups[] | {id, size_bytes}'
+```
+
+#### Restore from a backup
+
+```bash
+# Local backup ID
+vd pg:backups:restore clowk-lp/db b007 --yes
+
+# http(s) URL — e.g. an S3 presigned URL pointing at a pg_dump file
+vd pg:backups:restore clowk-lp/db https://my-bucket.s3.amazonaws.com/db.dump?... --yes
+```
+
+For URL inputs, the plugin downloads the file to a host temp dir, `docker cp`s it into `/tmp/<random>.dump` inside the primary, runs `pg_restore`, then cleans up both sides.
+
+Runs `pg_restore --clean --if-exists --no-owner --no-privileges` against the primary's database. **Destructive of database content** (drops + recreates every object the dump touches), but **non-destructive of the cluster** — pods stay up, standbys replicate the restored state via streaming WAL.
+
+Compared to the legacy `vd postgres:restore`:
+
+| | `pg:backups:restore` (Heroku-style) | `postgres:restore` (legacy) |
+|---|---|---|
+| Source | `pg_dump` custom format (in `/backups/`) | `pg_basebackup` tar (operator-supplied path) |
+| Destructive of | database content (objects in the dump) | entire cluster (PGDATA on every pod) |
+| Cluster downtime | none — primary stays up | full — every pod stopped, wiped, restarted |
+| Cross-version | yes (pg_dump portable) | no (pg_basebackup is exact bit copy) |
+| Cross-host | yes (pg_dump portable) | no (same major version + SSL state) |
+
+Pick `pg:backups:restore` for routine "rollback to last night" scenarios; `postgres:restore` for "salvage from a tar I have on a laptop after total host loss."
+
+#### Download a backup file
+
+Ship a backup off-host (laptop, S3 via host CLI, another voodu host):
+
+```bash
+vd pg:backups:download clowk-lp/db b007
+# → ./b007-20260507T020000Z.dump in CWD
+
+vd pg:backups:download clowk-lp/db b007 --to /srv/archive/db.dump
+```
+
+Bytes are copied verbatim via `docker cp`; the resulting file is a portable `pg_dump` custom format ready for `pg_restore` anywhere.
+
+#### Delete a backup
+
+```bash
+vd pg:backups:delete clowk-lp/db b007 --yes
+```
+
+Removes `/backups/<filename>` inside the pod (host bind-mount → file disappears from disk). Sequence IDs **don't** renumber — deleting `b005` leaves a gap, next capture is `b008` (max+1 of remaining). Operator's responsibility to ensure no off-host sync (S3, rsync) is mid-flight against the file.
+
+#### Schedule (paste-and-apply HCL helper)
+
+`pg:backups:schedule` prints the cronjob block ready to paste into `voodu.hcl`:
+
+```bash
+vd pg:backups:schedule clowk-lp/db --at "0 3 * * *" --from-replica 1
+```
+
+```hcl
+# Add this to your voodu.hcl, then run `vd apply`:
+
+cronjob "clowk-lp" "db-backup" {
+  schedule = "0 3 * * *"
+  image    = "ghcr.io/clowk/voodu-cli:latest"
+
+  command = ["bash", "-c", "vd pg:backups:capture clowk-lp/db --from-replica 1"]
+}
+
+# To remove the schedule later: delete the block + run `vd apply --prune`.
+```
+
+`pg:backups:schedule` itself emits no manifests and writes nothing — it's purely a templating helper. Voodu cronjobs are declarative (HCL is the source of truth); managed-schedule state plugin-side would diverge from HCL on the next `vd apply --prune`.
+
+Combine with off-host sync (rclone, aws s3 sync, rsync) in a sibling cronjob mounting the same host path read-only.
+
+#### Cancel an in-progress capture or restore
+
+```bash
+vd pg:backups:cancel clowk-lp/db
+# postgres clowk-lp/db: terminated 1 backup-related connection(s)
+```
+
+Queries `pg_stat_activity` for connections whose `application_name` is `pg_dump` or `pg_restore` and runs `pg_terminate_backend(pid)` on each. Postgres handles the cleanup — no PID files, no host-side signal plumbing. The cluster is unaffected; only the named connection closes.
+
+Useful when:
+- A capture is taking too long and you want to free up the source pod.
+- A restore needs to be aborted before it finishes drop+recreating objects. **Note**: a partial restore leaves the database in an inconsistent state — operator must follow up with a fresh restore from a known-good backup.
+
+#### Off-site durability
+
+```hcl
+cronjob "clowk-lp" "db-backups-s3-sync" {
+  schedule = "*/30 * * * *"
+  image    = "amazon/aws-cli:latest"
+  command  = ["s3", "sync", "/backups/", "s3://my-bucket/postgres/clowk-lp-db/"]
+  volumes  = ["/opt/voodu/backups/clowk-lp/db:/backups:ro"]
+  env_from = ["aws/cli"]
+}
+```
+
+Backup files are immutable once written, so `s3 sync` never re-uploads.
+
+### `vd postgres:backup` / `vd postgres:restore` (legacy, pg_basebackup)
+
+The original commands run `pg_basebackup` (physical snapshot) instead of `pg_dump` (logical dump). They still work and are the fastest path for full-cluster restores, but require operator-supplied paths and don't integrate with the `/backups` directory.
+
+```bash
+# pg_basebackup tar to operator-chosen path
 vd postgres:backup clowk-lp/db --destination /srv/backups/db-20260504.tar
 
-# Offload from a standby (avoids write contention on primary)
-vd postgres:backup clowk-lp/db --destination /srv/backups/db.tar --from-replica 1
-```
-
-Output is a tar with `base.tar` + `pg_wal.tar` (`-X stream` includes WAL needed to make the backup self-consistent — restore needs no archive_command access).
-
-### `vd postgres:restore`
-
-**DESTRUCTIVE** — wipes PGDATA on every pod, extracts the backup into the primary, then bootstraps standbys via `pg_basebackup`. Refuses to run without `--yes`.
-
-```bash
-# Latest restore (no PITR — replay all available WAL)
+# Restore (DESTRUCTIVE — wipes every pod's PGDATA)
 vd postgres:restore clowk-lp/db --from /srv/backups/db.tar --yes
-
-# Point-in-time recovery to just before a bad migration
-vd postgres:restore clowk-lp/db \
-  --from /srv/backups/db.tar \
-  --target-time "2026-05-04 14:30:00 UTC" \
-  --yes
 ```
 
-Workflow internals:
+Output is a tar with `base.tar` + `pg_wal.tar` (`-X stream` includes WAL needed to make the backup self-consistent). Point-in-snapshot only — no PITR.
 
-1. `docker stop` every pod (primary + standbys)
-2. Wipe primary's PGDATA via `docker run --volumes-from`
-3. Extract backup tar into PGDATA (one-shot container shares the volume)
-4. (PITR) Append `recovery_target_time = '<ts>'` + `restore_command = 'cp /wal-archive/%f %p'` to `postgresql.auto.conf`, drop `recovery.signal`
-5. `docker start` primary — postgres replays WAL on startup, promotes when target reached
-6. Wipe each standby's PGDATA + start — wrapper's first-boot path bootstraps via `pg_basebackup` against the just-restored primary
+> **`pg:backups:restore` / `:download` / `:delete` / `:schedule` will replace this surface in the next iteration.**
 
-**When pg_rewind/restore fails on a standby**: same fallback as M-P5 rejoin — `vd delete --replica N --prune` + re-apply forces a fresh standby bootstrap.
-
-### WAL cleanup pattern
-
-Plugin doesn't auto-prune the WAL archive — declare a cleanup cronjob:
-
-```hcl
-cronjob "clowk-lp" "wal-cleanup" {
-  schedule = "0 2 * * *"               # daily at 02:00
-  image    = "postgres:16"
-  command  = ["bash", "-c", "find /wal-archive -mmin +10080 -delete"]
-  # 10080 minutes = 7 days
-
-  volumes = [
-    "/opt/voodu/backups/clowk-lp/db:/wal-archive:rw",
-  ]
-}
-```
-
-For S3/R2 archives (operator-overridden `archive_command`), no cleanup cronjob needed — set bucket lifecycle policy on the cloud side.
-
-### Scheduled basebackups
-
-Wrap `vd postgres:backup` in a voodu cronjob — produces a daily `pg_basebackup` tar (snapshot of full cluster state):
-
-```hcl
-cronjob "clowk-lp" "db-basebackup" {
-  schedule = "0 3 * * *"                          # daily at 03:00
-  image    = "ghcr.io/clowk/voodu-cli:latest"     # has vd binary
-
-  command = ["bash", "-c",
-    "vd postgres:backup clowk-lp/db --destination /backup/db-$(date +%Y%m%d).tar --from-replica 1"]
-
-  volumes = ["/srv/pg-backups:/backup:rw"]
-}
-```
-
-`--from-replica 1` offloads the snapshot work to a standby (no write contention on primary). Tar lives on the host's `/srv/pg-backups`. Pair this with the WAL replication below for full point-in-time recovery coverage.
-
-### Off-site WAL replication (S3 + R2 double durability)
-
-WAL replication to multiple clouds gives you point-in-time recovery (PITR) even after a total host loss. Architecture:
-
-```
-postgres archive_command writes LOCAL (/wal-archive)
-       ↓
-       ├── cronjob A: sync /wal-archive → AWS S3   (every 15 min)
-       ├── cronjob B: sync /wal-archive → CF R2    (every 15 min, +5 offset)
-       └── cronjob C: cleanup local > 7 days       (daily)
-```
-
-Postgres keeps WAL local for 7 days; both S3 and R2 mirror it asynchronously. After the retention window, local cleanup runs — durability survives via the cloud copies. Bucket lifecycle policies on the cloud side handle long-term retention.
-
-#### One-time setup — credential buckets
-
-Use voodu's [shared config bucket pattern](#bucket-keys-config) to inject AWS-format env vars into the sync cronjobs. Cloudflare R2 is S3-compatible, so the same `awscli` image talks to both — only the endpoint URL differs.
-
-```bash
-# AWS S3
-vd config aws/cli set AWS_ACCESS_KEY_ID=AKIA...
-vd config aws/cli set AWS_SECRET_ACCESS_KEY=<aws-secret>
-vd config aws/cli set AWS_DEFAULT_REGION=us-east-1
-
-# Cloudflare R2 (S3-compatible API — same env var names, different endpoint)
-vd config cloudflare/r2 set AWS_ACCESS_KEY_ID=<r2-access-key>
-vd config cloudflare/r2 set AWS_SECRET_ACCESS_KEY=<r2-secret-key>
-vd config cloudflare/r2 set AWS_DEFAULT_REGION=auto
-vd config cloudflare/r2 set AWS_ENDPOINT_URL=https://<account-id>.r2.cloudflarestorage.com
-```
-
-#### Cronjobs (HCL)
-
-```hcl
-# WAL → AWS S3
-cronjob "clowk-lp" "wal-sync-s3" {
-  schedule = "*/15 * * * *"             # every 15 min, on the quarter
-  image    = "amazon/aws-cli:latest"
-
-  command = [
-    "s3", "sync", "/wal-archive/", "s3://<your-aws-bucket>/postgres-wal/",
-    "--no-progress",
-    "--only-show-errors",
-  ]
-
-  env_from = ["aws/cli"]
-  volumes  = ["/opt/voodu/backups/clowk-lp/db:/wal-archive:ro"]
-}
-
-# WAL → Cloudflare R2
-cronjob "clowk-lp" "wal-sync-r2" {
-  schedule = "5-59/15 * * * *"          # every 15 min, offset +5 from S3
-  image    = "amazon/aws-cli:latest"
-
-  command = [
-    "s3", "sync", "/wal-archive/", "s3://<your-r2-bucket>/postgres-wal/",
-    "--no-progress",
-    "--only-show-errors",
-  ]
-
-  env_from = ["cloudflare/r2"]
-  volumes  = ["/opt/voodu/backups/clowk-lp/db:/wal-archive:ro"]
-}
-
-# Local cleanup (post-replication retention)
-cronjob "clowk-lp" "wal-cleanup" {
-  schedule = "0 6 * * *"                # daily 06:00
-  image    = "alpine"
-
-  command = [
-    "sh", "-c",
-    "find /wal-archive -type f -mmin +10080 -delete",  # 7 days local retention
-  ]
-
-  volumes = ["/opt/voodu/backups/clowk-lp/db:/wal-archive:rw"]
-}
-```
-
-Apply alongside the postgres resource:
-
-```bash
-vd apply -f voodu.hcl
-```
-
-#### Design rationale
-
-| Decision | Why |
-|---|---|
-| Sync cronjobs (not inline `archive_command`) | Inline would block postgres on every WAL flush; failure in any cloud stalls the writer. Async sync decouples — postgres writes locally fast, replication catches up |
-| `:ro` mount on sync cronjobs | Sync only reads. Defensive against awscli bugs that might write back |
-| `*/15` + `5-59/15` offset | Stagger S3 and R2 by 5 min; avoids dual `aws s3 sync` competing for IO on the same volume |
-| `--only-show-errors` | Without it, `aws s3 sync` logs every upload — daily logs balloon. Errors still surface |
-| `amazon/aws-cli:latest` for both | R2 speaks S3 API; same binary works for both clouds |
-| `cloudflare/r2` bucket reuses `AWS_*` env names | awscli reads `AWS_ENDPOINT_URL` natively (v2.13+) — no env var translation needed |
-| 7-day local retention | Buffer against extended cloud outage; cleanup cronjob trims after that |
-
-#### Verifying
-
-```bash
-# Postgres pod-0 archiving locally?
-docker exec clowk-lp-db.0 ls -lh /wal-archive | head
-# → 16MB hex-named files (00000001000000000000000A, etc.)
-
-# S3 sync ran?
-vd logs cronjob clowk-lp/wal-sync-s3
-# → Empty (success, --only-show-errors) or "upload: ..." lines
-
-# R2 sync ran?
-vd logs cronjob clowk-lp/wal-sync-r2
-
-# Confirm WALs landed in S3
-aws s3 ls s3://<your-aws-bucket>/postgres-wal/ | tail
-
-# Confirm WALs landed in R2
-aws s3 ls s3://<your-r2-bucket>/postgres-wal/ \
-  --endpoint-url https://<account-id>.r2.cloudflarestorage.com | tail
-```
-
-#### Cloud-side bucket lifecycle (operator-side, fora do voodu)
-
-For long-term retention beyond the 7-day local window, configure lifecycle policies on the cloud console:
-
-**AWS S3** — JSON lifecycle rule (via Console or `aws s3api put-bucket-lifecycle-configuration`):
-
-```json
-{
-  "Rules": [{
-    "Id": "wal-archive-tiering",
-    "Status": "Enabled",
-    "Filter": { "Prefix": "postgres-wal/" },
-    "Transitions": [
-      { "Days": 30, "StorageClass": "STANDARD_IA" },
-      { "Days": 90, "StorageClass": "GLACIER" }
-    ],
-    "Expiration": { "Days": 365 }
-  }]
-}
-```
-
-**Cloudflare R2** — Dashboard → bucket → Settings → Lifecycle. R2 has a single tier (no Glacier equivalent), so policy is just `Delete after N days`. 90/180-day expiration is typical.
-
-### Alternative archive destinations
-
-The cronjob pattern is destination-agnostic — `aws s3 sync` is just one tool that happens to mount the WAL archive volume. Any container that can read `/wal-archive` and ship the bytes elsewhere works the same way. Some common alternatives:
-
-#### rsync to a backup VM (LAN, no egress cost)
-
-Useful when you have a bastion / NAS / dedicated backup host on the same private network. Zero cloud bills, but durability is bounded by your single backup host.
-
-```hcl
-cronjob "clowk-lp" "wal-rsync" {
-  schedule = "*/15 * * * *"
-  image    = "alpine"
-
-  command = ["sh", "-c",
-    "apk add --no-cache rsync openssh-client && \
-     rsync -avz \
-       -e 'ssh -i /ssh/id_ed25519 -o StrictHostKeyChecking=no' \
-       /wal-archive/ backup@storage.lan:/srv/pg-wal/clowk-lp/db/"]
-
-  volumes = [
-    "/opt/voodu/backups/clowk-lp/db:/wal-archive:ro",
-    "/etc/voodu/secrets/ssh:/ssh:ro",       # SSH key bind-mounted from host
-  ]
-}
-```
-
-#### restic — deduped + encrypted backups
-
-`restic` deduplicates at the chunk level and encrypts client-side. Storage cost drops sharply for WAL (lots of incremental similarity), and the repo is opaque to whoever holds the bucket — even with stolen S3 credentials, no readable data without the password.
-
-```hcl
-cronjob "clowk-lp" "wal-restic" {
-  schedule = "0 */4 * * *"             # every 4 hours
-  image    = "restic/restic:latest"
-
-  command = ["backup", "/wal-archive",
-             "--tag", "wal",
-             "--host", "clowk-lp-db"]
-
-  env_from = ["restic/clowk"]    # RESTIC_REPOSITORY (s3:..., b2:..., sftp:...),
-                                  # RESTIC_PASSWORD,
-                                  # AWS_* if backend is S3
-  volumes = ["/opt/voodu/backups/clowk-lp/db:/wal-archive:ro"]
-}
-```
-
-#### NFS mount (no cronjob — direct postgres archive)
-
-If your `destination` IS the durable storage (NFS mount on the host, dedicated SSD, etc.), no sync cronjob needed. Postgres archives directly there. Trade-off: if NFS goes slow or away, postgres' `archive_command` blocks the writer.
-
-```hcl
-postgres "clowk-lp" "db" {
-  # ... rest of spec ...
-
-  wal_archive = {
-    enabled     = true
-    strategy    = "local"
-    destination = "/mnt/nfs/postgres-wal/clowk-lp-db"  # NFS mount mounted
-                                                       # on the host outside voodu
-  }
-}
-```
-
-(A future `strategy = "nfs"` will manage the NFS mount itself — for now you handle that via systemd or fstab and point `destination` at the local mountpoint.)
-
-#### Trade-off summary
-
-| Destination | Egress cost | Durability | Setup effort | Best for |
-|---|---|---|---|---|
-| **S3 + R2** (recommended) | Low (storage cents) | Multi-region, multi-cloud | Low (creds + lifecycle) | Production, geo-redundant |
-| **rsync to backup VM** | Zero (LAN) | Single host (one disk) | Medium (SSH keys, host OS) | Dev / homelab, fast LAN |
-| **restic** (any backend) | Low | Encrypted + deduped | Medium (repo init, password mgmt) | Long-retention, sensitive data |
-| **NFS direct mount** | N/A | Inherited from NAS | Low (docker volume driver) | When NAS is the source of truth |
-
-You can mix: S3 for off-site disaster recovery + rsync to the LAN NAS for fast local restore + a daily restic snapshot for compliance. Each is just one more cronjob.
-
----
-
-## Disaster recovery
-
-### Restore from cloud archive
-
-When the host VM is gone (catastrophic loss) and you need to rebuild from S3 or R2, the workflow is:
-
-1. **Provision a new VM** with voodu running.
-2. **Re-apply the postgres HCL** — voodu creates fresh empty pods, primary fails to start (no data, no archive to bootstrap from). That's expected; we'll restore over it.
-3. **Pull the latest basebackup tar + WAL** from the cloud you trust most (whichever finished its sync first wins).
-4. **Run `vd postgres:restore`** with optional `--target-time` for PITR.
-
-```bash
-# Step 1+2: provision + apply (pods spawn empty)
-vd apply -f voodu.hcl
-
-# Step 3: pull tar + WAL archive from S3
-mkdir -p /tmp/dr/wal-archive
-
-aws s3 cp s3://<your-aws-bucket>/basebackups/db-20260504.tar /tmp/dr/db-snapshot.tar
-aws s3 sync s3://<your-aws-bucket>/postgres-wal/ /tmp/dr/wal-archive/
-
-# Pre-seed the wal-archive volume so PITR's restore_command finds the WAL
-docker run --rm \
-  --volumes-from clowk-lp-db.0 \
-  -v /tmp/dr/wal-archive:/import:ro \
-  alpine sh -c "cp /import/* /wal-archive/"
-
-# Step 4: restore (latest, no PITR)
-vd postgres:restore clowk-lp/db --from /tmp/dr/db-snapshot.tar --yes
-
-# OR — restore to a specific moment (PITR)
-vd postgres:restore clowk-lp/db \
-  --from /tmp/dr/db-snapshot.tar \
-  --target-time "2026-05-04 14:30:00 UTC" \
-  --yes
-```
-
-The restore wipes PGDATA, extracts the tar, configures `recovery_target_time` (if `--target-time` passed), arms `recovery.signal`, and starts postgres. Postgres replays WAL from `/wal-archive` (where you just pre-seeded the cloud archive) until the target time, then promotes itself to primary. Standbys re-bootstrap automatically via `pg_basebackup`.
-
-### Recovery scenarios
-
-| Scenario | Recovery path |
-|---|---|
-| **Single standby pod corrupted** | `vd delete clowk-lp/db --replica 2 --prune` + `vd apply -f voodu.hcl` — the wrapper's first-boot path runs `pg_basebackup` from primary, bootstrapping a fresh standby |
-| **Old primary diverged after promote** | `vd postgres:rejoin clowk-lp/db --replica 0` — runs `pg_rewind` against new primary, reattaches as standby |
-| **Pod-0 PGDATA volume lost (still on the same host)** | Re-apply HCL → pod-0 boots empty → wrapper-treats as first-boot, BUT it's primary so initdb runs and you lose data. **DON'T** rely on this; use the basebackup tar restore path below |
-| **Whole host gone (basebackup tar still on /srv)** | `vd postgres:restore clowk-lp/db --from /srv/pg-backups/db-<date>.tar --yes` |
-| **Whole host AND `/srv` gone, but cloud archive intact** | The full disaster path — see [Restore from cloud archive](#restore-from-cloud-archive) above |
-| **Need to roll back to a specific timestamp** | Same as cloud restore but pass `--target-time "<ts>"` to `vd postgres:restore`. Postgres replays WAL until that timestamp then stops |
-
-#### RPO + RTO with the 3-cronjob setup
-
-| Scenario | RPO (data loss) | RTO (time to recover) |
-|---|---|---|
-| Standby corrupted | 0 (primary intact) | ~minutes (basebackup over network) |
-| Primary failover | depends on lag (lag check + `--force` controls this) | ~30s (promote + rolling restart) |
-| Full host loss + cloud archive | up to 15min of WAL (sync interval) | ~10-30 min (provision VM + apply + restore) |
-
-For tighter RPO on the cloud-loss scenario, drop the cronjob schedule to `*/5 * * * *` (every 5 min) — pays slightly more egress cost.
-
----
-
-## Connecting via `psql`
-
-`vd postgres:psql` shells into postgres without password — connection goes through the container's unix socket (trust auth in the stock pg_hba.conf):
-
-```bash
-# Interactive REPL on primary
-vd postgres:psql clowk-lp/db
-
-# Interactive on a standby (read-only)
-vd postgres:psql clowk-lp/db --replica 1
-
-# One-shot query
-vd postgres:psql clowk-lp/db -c "SELECT version();"
-
-# Replication status — debug standby lag
-vd postgres:psql clowk-lp/db -c "SELECT * FROM pg_stat_replication;"
-
-# CSV output via passthrough flag
-vd postgres:psql clowk-lp/db -- --csv -c "SELECT * FROM pg_stat_database"
-
-# Manual failover step 1
-vd postgres:psql clowk-lp/db --replica 1 -c "SELECT pg_promote();"
-```
-
-Heroku-style — operator doesn't need to know password, host, or user. Plugin reads `POSTGRES_USER`/`POSTGRES_DB` from the statefulset env to compose the right `psql -U <user> -d <db>` invocation.
 
 ---
 
@@ -1015,10 +688,6 @@ vd apply -f voodu.hcl
 vd postgres:psql clowk-lp/db -c "CREATE EXTENSION IF NOT EXISTS pgvector"
 ```
 
-### WAL archive to S3 + R2 (multi-cloud durability)
-
-The full setup — credential buckets, sync cronjobs, lifecycle policies — lives in [Off-site WAL replication](#off-site-wal-replication-s3--r2-double-durability) under Backup automation. Recommended approach: postgres archives locally, separate cronjobs sync to S3 + R2 asynchronously. Disaster recovery from cloud is documented at [Restore from cloud archive](#restore-from-cloud-archive).
-
 ### External access for DBeaver / TablePlus
 
 ```bash
@@ -1056,25 +725,31 @@ vd postgres:unexpose clowk-lp/db
 | `vd postgres:promote <postgres> --replica <N> [--force] [--no-restart]` | Promote a standby to primary (plugin runs `pg_promote()` internally; refuses on lag without `--force`) |
 | `vd postgres:rejoin <postgres> --replica <N>` | Re-attach a divergent pod as standby via `pg_rewind` |
 | `vd postgres:psql <postgres> [--replica N] [-c "<sql>"]` | Drop into psql against the cluster (no password needed) |
-| `vd postgres:backup <postgres> --destination <path> [--from-replica N]` | `pg_basebackup` snapshot to a tar file |
-| `vd postgres:restore <postgres> --from <path> [--target-time "<ts>"] --yes` | Restore from a tar (DESTRUCTIVE; PITR via `--target-time`) |
+| `vd pg:backups <postgres> [-o json]` | List backups (Heroku-style; reads `/backups/`) |
+| `vd pg:backups:capture <postgres> [--from-replica N]` | Take a fresh `pg_dump` snapshot |
+| `vd pg:backups:restore <postgres> <id\|url> --yes` | `pg_restore` from local id or http(s) URL (DESTRUCTIVE of db content) |
+| `vd pg:backups:download <postgres> <id> [--to <path>]` | Copy a backup file from the pod to the host |
+| `vd pg:backups:delete <postgres> <id> --yes` | Remove a backup file from `/backups/` |
+| `vd pg:backups:schedule <postgres> [--at <cron>] [--from-replica N]` | Print cronjob HCL template for paste-and-apply |
+| `vd pg:backups:cancel <postgres>` | Terminate any `pg_dump` or `pg_restore` in progress |
+| `vd postgres:backup <postgres> --destination <path> [--from-replica N]` | (legacy) `pg_basebackup` snapshot to a tar file |
+| `vd postgres:restore <postgres> --from <path> --yes` | (legacy) Restore PGDATA from a tar (DESTRUCTIVE of cluster) |
 | `vd postgres:help` | Plugin overview |
 
 Pass `--help` to any subcommand for full usage.
 
 ### Asset files emitted
 
-The plugin emits one asset per postgres resource with 5 files:
+The plugin emits one asset per postgres resource with 4 files:
 
 | Key | Mount path | Loaded by |
 |---|---|---|
 | `entrypoint` | `/usr/local/bin/voodu-postgres-entrypoint` | `command = ["bash", ...]` |
 | `pg_overrides_conf` | `/etc/postgresql/voodu-99-overrides.conf` | postgres `include_dir` (operator pg_config) |
-| `wal_archive_conf` | `/etc/postgresql/voodu-00-wal-archive.conf` | postgres `include_dir` (plugin WAL defaults) |
 | `streaming_conf` | `/etc/postgresql/voodu-50-streaming.conf` | postgres `include_dir` (primary_conninfo, hot_standby) |
 | `init_replication_sh` | `/docker-entrypoint-initdb.d/00_create_replication.sh` | docker-entrypoint.sh on first boot of primary only |
 
-The `voodu-NN-` prefixes order the include_dir scan: plugin defaults (00, 50) load first, operator overrides (99) load last. "Last config wins" → operator pg_config trumps plugin defaults cleanly.
+The `voodu-NN-` prefixes order the include_dir scan: plugin defaults (50) load before operator overrides (99). "Last config wins" → operator pg_config trumps plugin defaults cleanly.
 
 ### Statefulset env vars
 
@@ -1110,7 +785,6 @@ cmd/voodu-postgres/
   entrypoint.go         # bash wrapper renderer (role-aware)
   pgconfig.go           # postgresql.conf overrides renderer
   password.go           # superuser password lifecycle
-  wal_archive.go        # WAL archive parser/validator/renderer
   replication.go        # replication password lifecycle + streaming.conf + init script
   controller.go         # invocationContext + controllerClient
   link.go               # cmdLink + cmdUnlink + URL builder + linked consumers
@@ -1171,17 +845,21 @@ Each pod gets its own `data` volume — postgres' authoritative data directory. 
 
 Standbys (ordinal 1+) get their own per-pod `data` volume (`voodu-<scope>-<name>-data-1`, `-2`, …). Each pod is independent — losing one pod's data volume forces a re-bootstrap from the primary via `pg_basebackup`, but the others stay healthy.
 
-### Shared WAL archive (strategy-driven)
+### Backups directory (shared host bind-mount)
 
-WAL archive is **cluster-level** state, not pod-level. The `wal_archive { strategy = ... }` block picks how WAL leaves the pod. Today only `local` ships (bind-mount of a host directory at `/wal-archive`); future strategies (`s3`, `r2`, `nfs`, `rsync`) plug in via the same interface.
+Every pod mounts `/opt/voodu/backups/<scope>/<name>/` from the host at `/backups` inside the container (rw on every pod). `vd pg:backups:capture` writes `pg_dump` files here; cronjobs sync the dir to off-host storage.
 
-For `strategy = "local"` (default):
-
-| Source | Container path | Mount mode | Default destination |
+| Source | Container path | Mount mode | Default |
 |---|---|---|---|
-| host bind-mount | `/wal-archive` | `:rw` (all pods) | `/opt/voodu/backups/<scope>/<name>` |
+| host bind-mount | `/backups` | `:rw` (all pods) | `/opt/voodu/backups/<scope>/<name>` |
 
-Override the host path with `wal_archive = { destination = "..." }`. Operator must `mkdir -p` and `chown 999:999` the destination before `vd apply` (postgres uid/gid inside the container is 999). See [WAL archive](#wal-archive) for the full setup.
+**Pre-flight (operator, once per host)**:
+
+```bash
+sudo mkdir -p /opt/voodu/backups/clowk-lp/db
+```
+
+Ownership (`postgres:postgres`, uid 999) is auto-fixed by the entrypoint wrapper at boot — no manual `chown` needed.
 
 ## License
 

@@ -106,13 +106,6 @@ type postgresSpec struct {
 	// adds startup latency for no operator benefit.
 	Extensions []string
 
-	// WALArchive carries the operator's `wal_archive { ... }`
-	// block. nil means the operator omitted the block entirely;
-	// the caller substitutes defaultWALArchiveSpec() (enabled,
-	// /wal-archive). M-P2 introduces this — see wal_archive.go
-	// for the parser, validator, and conf renderer.
-	WALArchive *walArchiveSpec
-
 	// ReplicationUser is the postgres ROLE used for streaming
 	// replication. Default "replicator". Distinct from the
 	// superuser (User field) by security best practice — the
@@ -271,13 +264,6 @@ func parsePostgresSpec(operatorSpec map[string]any) (*postgresSpec, error) {
 		}
 	}
 
-	wal, err := parseWALArchiveSpec(operatorSpec)
-	if err != nil {
-		return nil, err
-	}
-
-	spec.WALArchive = wal
-
 	return spec, nil
 }
 
@@ -334,10 +320,6 @@ func validatePostgresSpec(spec *postgresSpec) error {
 		if !isValidPgConfigKey(key) {
 			return fmt.Errorf("pg_config key %q is not a valid postgres parameter name (must match [a-z][a-z0-9_]*; anti-injection guard)", key)
 		}
-	}
-
-	if err := validateWALArchiveSpec(spec.WALArchive); err != nil {
-		return err
 	}
 
 	return nil
@@ -470,7 +452,6 @@ func stripPluginOwnedFields(merged map[string]any) {
 	delete(merged, "initdb_encoding")
 	delete(merged, "pg_config")
 	delete(merged, "extensions")
-	delete(merged, "wal_archive")
 	delete(merged, "replication_user")
 }
 

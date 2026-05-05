@@ -12,7 +12,7 @@ import (
 func TestParseRestoreFlags_FromLong(t *testing.T) {
 	args := []string{"clowk-lp/db", "--from", "/srv/db.tar"}
 
-	pos, src, _, _, err := parseRestoreFlags(args)
+	pos, src, _, err := parseRestoreFlags(args)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -29,7 +29,7 @@ func TestParseRestoreFlags_FromLong(t *testing.T) {
 func TestParseRestoreFlags_FromShort(t *testing.T) {
 	args := []string{"clowk-lp/db", "-f", "/srv/db.tar"}
 
-	_, src, _, _, err := parseRestoreFlags(args)
+	_, src, _, err := parseRestoreFlags(args)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -42,39 +42,13 @@ func TestParseRestoreFlags_FromShort(t *testing.T) {
 func TestParseRestoreFlags_FromEqualsForm(t *testing.T) {
 	args := []string{"clowk-lp/db", "--from=/tmp/db.tar"}
 
-	_, src, _, _, err := parseRestoreFlags(args)
+	_, src, _, err := parseRestoreFlags(args)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 
 	if src != "/tmp/db.tar" {
 		t.Errorf("src: got %q", src)
-	}
-}
-
-func TestParseRestoreFlags_TargetTime(t *testing.T) {
-	args := []string{"clowk-lp/db", "--from", "/tmp/db.tar", "--target-time", "2026-05-04 14:30:00"}
-
-	_, _, targetTime, _, err := parseRestoreFlags(args)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-
-	if targetTime != "2026-05-04 14:30:00" {
-		t.Errorf("target-time: got %q", targetTime)
-	}
-}
-
-func TestParseRestoreFlags_TargetTimeEqualsForm(t *testing.T) {
-	args := []string{"clowk-lp/db", "--from=/tmp/db.tar", "--target-time=2026-05-04 14:30:00 UTC"}
-
-	_, _, targetTime, _, err := parseRestoreFlags(args)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-
-	if targetTime != "2026-05-04 14:30:00 UTC" {
-		t.Errorf("target-time: got %q", targetTime)
 	}
 }
 
@@ -89,7 +63,7 @@ func TestParseRestoreFlags_AutoYesForms(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		_, _, _, autoYes, _ := parseRestoreFlags(tc.args)
+		_, _, autoYes, _ := parseRestoreFlags(tc.args)
 		if autoYes != tc.wantOK {
 			t.Errorf("args %v: autoYes=%v, want %v", tc.args, autoYes, tc.wantOK)
 		}
@@ -99,39 +73,17 @@ func TestParseRestoreFlags_AutoYesForms(t *testing.T) {
 func TestParseRestoreFlags_FromMissingValue(t *testing.T) {
 	args := []string{"clowk-lp/db", "--from"}
 
-	_, _, _, _, err := parseRestoreFlags(args)
+	_, _, _, err := parseRestoreFlags(args)
 	if err == nil {
 		t.Fatal("expected error for missing value")
 	}
 }
 
-func TestEscapeSingleQuote(t *testing.T) {
-	cases := []struct {
-		in, want string
-	}{
-		{"", ""},
-		{"abc", "abc"},
-		{"O'Reilly", "O''Reilly"},
-		{"'leading", "''leading"},
-		{"trailing'", "trailing''"},
-		{"two''already", "two''''already"},
-	}
-
-	for _, tc := range cases {
-		got := escapeSingleQuote(tc.in)
-		if got != tc.want {
-			t.Errorf("escapeSingleQuote(%q): got %q, want %q", tc.in, got, tc.want)
-		}
-	}
-}
-
-func TestRestoreHelpMentionsDestructiveAndPITR(t *testing.T) {
+func TestRestoreHelpMentionsDestructive(t *testing.T) {
 	wantPhrases := []string{
 		"DESTRUCTIVE",
 		"NO rollback",
 		"--yes",
-		"Point-in-time",
-		"--target-time",
 		"pg_basebackup",
 	}
 

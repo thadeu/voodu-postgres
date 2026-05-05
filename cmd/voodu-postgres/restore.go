@@ -1,5 +1,5 @@
 // `vd postgres:restore` — restore a cluster from a pg_basebackup
-// snapshot, with optional point-in-time-recovery via WAL replay.
+// snapshot.
 //
 // # Workflow
 //
@@ -13,14 +13,16 @@
 //        docker run --rm --volumes-from <primary> postgres \
 //          tar -xf /backup/db.tar -C $PGDATA
 //
-//   4. (PITR) Drop a recovery.signal file + write recovery_target_time
-//      into postgresql.auto.conf. Postgres replays archived WAL until
-//      the target time, then promotes itself to primary.
-//   5. Start primary container. It boots, replays WAL (post-basebackup
-//      crash recovery + PITR if applicable), accepts connections.
-//   6. Wipe + bootstrap each standby's PGDATA from scratch — the
+//   4. Start primary container. It boots, replays the WAL embedded
+//      in the basebackup (`-X stream` shipped enough WAL to make the
+//      tar self-consistent), and accepts connections.
+//   5. Wipe + bootstrap each standby's PGDATA from scratch — the
 //      wrapper's first-boot path runs pg_basebackup against the new
 //      primary and gets a fresh, correctly-aligned copy.
+//
+// Restore is point-in-snapshot only — there is NO point-in-time
+// recovery (no WAL archive). For per-minute granularity, take more
+// frequent snapshots.
 //
 // # Why we wipe + recreate standbys instead of restoring them too
 //
@@ -50,7 +52,7 @@ import (
 const restoreHelp = `vd postgres:restore — restore a cluster from a pg_basebackup snapshot.
 
 USAGE
-  vd postgres:restore <postgres-scope/name> --from <path> [--target-time "<timestamp>"] [--yes]
+  vd postgres:restore <postgres-scope/name> --from <path> [--yes]
 
 ARGUMENTS
   <postgres-scope/name>   The postgres cluster.
@@ -59,11 +61,6 @@ FLAGS
   --from <path>           Backup tar file (the output of
                           vd postgres:backup). Required. Path is on
                           the docker host.
-  --target-time "<ts>"    Point-in-time recovery target. Postgres
-                          replays archived WAL until this timestamp.
-                          Format: "YYYY-MM-DD HH:MM:SS[+TZ]". Optional;
-                          omit for "restore latest from this backup +
-                          replay all available WAL".
   --yes, -y               Skip the destructive-action confirmation
                           prompt. Required when stdin is non-interactive
                           (cronjobs etc.).
@@ -81,22 +78,14 @@ WORKFLOW
   2. Wipe primary's PGDATA.
   3. Extract <backup-path> into primary's PGDATA via one-shot
      docker run --volumes-from.
-  4. (--target-time) Write recovery_target_time into
-     postgresql.auto.conf and drop recovery.signal.
-  5. Start primary; postgres replays WAL, promotes when caught up.
-  6. Wipe each standby's PGDATA. The wrapper's first-boot path
+  4. Start primary; postgres replays the WAL embedded in the
+     basebackup, then accepts connections.
+  5. Wipe each standby's PGDATA. The wrapper's first-boot path
      bootstraps each via pg_basebackup against the new primary on
      next start.
 
 EXAMPLES
-  # Latest restore (no PITR)
   vd postgres:restore clowk-lp/db --from /srv/backups/db-20260504.tar --yes
-
-  # Point-in-time recovery to just before a bad migration
-  vd postgres:restore clowk-lp/db \
-    --from /srv/backups/db-20260504.tar \
-    --target-time "2026-05-04 14:30:00 UTC" \
-    --yes
 
 PRE-FLIGHT
   - The backup file must exist + be readable on this host.
@@ -117,13 +106,13 @@ func cmdRestore() error {
 		return nil
 	}
 
-	positional, src, targetTime, autoYes, err := parseRestoreFlags(args)
+	positional, src, autoYes, err := parseRestoreFlags(args)
 	if err != nil {
 		return err
 	}
 
 	if len(positional) < 1 {
-		return fmt.Errorf("usage: vd postgres:restore <postgres-scope/name> --from <path> [--target-time \"<ts>\"] [--yes]")
+		return fmt.Errorf("usage: vd postgres:restore <postgres-scope/name> --from <path> [--yes]")
 	}
 
 	if src == "" {
@@ -223,18 +212,10 @@ func cmdRestore() error {
 		return fmt.Errorf("extract backup: %w", err)
 	}
 
-	// Step 4: PITR setup (if --target-time given).
-	if targetTime != "" {
-		fmt.Fprintf(os.Stderr, "restore: configuring PITR — recovery_target_time=%s\n", targetTime)
-
-		if err := writePITRConfig(primaryContainer, image, pgdataPath, targetTime); err != nil {
-			return fmt.Errorf("write PITR config: %w", err)
-		}
-	}
-
-	// Step 5: start primary. Postgres replays WAL on startup
-	// (basebackup brought consistent state; PITR replays archived
-	// WAL until target_time then exits recovery via pg_promote).
+	// Step 4: start primary. Postgres replays the WAL embedded in
+	// the basebackup tar (-X stream during pg_basebackup shipped
+	// enough WAL to make the snapshot self-consistent), then
+	// accepts connections.
 	fmt.Fprintf(os.Stderr, "restore: starting primary %s\n", primaryContainer)
 
 	if err := dockerStart(primaryContainer); err != nil {
@@ -266,31 +247,26 @@ func cmdRestore() error {
 		}
 	}
 
-	pitrSuffix := ""
-	if targetTime != "" {
-		pitrSuffix = fmt.Sprintf(" (PITR target: %s)", targetTime)
-	}
-
 	result := dispatchOutput{
 		Message: fmt.Sprintf(
-			"postgres %s: restored from %s%s. Primary up; standbys rebootstrapping via pg_basebackup. "+
+			"postgres %s: restored from %s. Primary up; standbys rebootstrapping via pg_basebackup. "+
 				"Watch `vd logs %s` to confirm WAL replay completed.",
-			refOrName(scope, name), src, pitrSuffix, refOrName(scope, name)),
+			refOrName(scope, name), src, refOrName(scope, name)),
 		Actions: nil,
 	}
 
 	return writeDispatchOutput(result)
 }
 
-// parseRestoreFlags extracts --from, --target-time, --yes/-y.
-func parseRestoreFlags(args []string) (positional []string, src, targetTime string, autoYes bool, err error) {
+// parseRestoreFlags extracts --from, --yes/-y.
+func parseRestoreFlags(args []string) (positional []string, src string, autoYes bool, err error) {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 
 		switch {
 		case a == "--from" || a == "-f":
 			if i+1 >= len(args) {
-				return nil, "", "", false, fmt.Errorf("--from requires a path")
+				return nil, "", false, fmt.Errorf("--from requires a path")
 			}
 
 			src = args[i+1]
@@ -298,17 +274,6 @@ func parseRestoreFlags(args []string) (positional []string, src, targetTime stri
 
 		case len(a) > 7 && a[:7] == "--from=":
 			src = a[7:]
-
-		case a == "--target-time":
-			if i+1 >= len(args) {
-				return nil, "", "", false, fmt.Errorf("--target-time requires a timestamp")
-			}
-
-			targetTime = args[i+1]
-			i++
-
-		case len(a) > 14 && a[:14] == "--target-time=":
-			targetTime = a[14:]
 
 		case a == "--yes" || a == "-y":
 			autoYes = true
@@ -321,7 +286,7 @@ func parseRestoreFlags(args []string) (positional []string, src, targetTime stri
 		}
 	}
 
-	return positional, src, targetTime, autoYes, nil
+	return positional, src, autoYes, nil
 }
 
 // wipePGDataViaDocker deletes everything inside PGDATA from a
@@ -369,55 +334,3 @@ func extractBackupViaDocker(targetContainer, image, pgdataPath, srcTar string) e
 	return cmd.Run()
 }
 
-// writePITRConfig drops postgresql.auto.conf with
-// `recovery_target_time = '<targetTime>'` and `restore_command =
-// 'cp /wal-archive/%f %p'` plus a recovery.signal file. Postgres
-// reads these on startup and enters PITR replay mode; once the
-// target time is reached, postgres promotes itself out of recovery.
-func writePITRConfig(targetContainer, image, pgdataPath, targetTime string) error {
-	// auto.conf: postgres-managed file; we splice our settings.
-	// restore_command points at the WAL archive volume the plugin
-	// emits at /wal-archive (M-P2 default mount path).
-	autoConf := fmt.Sprintf(`
-# voodu-postgres restore — PITR setup
-restore_command = 'cp /wal-archive/%%f %%p'
-recovery_target_time = '%s'
-recovery_target_action = 'promote'
-`, escapeSingleQuote(targetTime))
-
-	// Append to postgresql.auto.conf + create recovery.signal
-	// in a one-shot container sharing the volume.
-	script := fmt.Sprintf(
-		"cat >> %s/postgresql.auto.conf <<'EOF'\n%sEOF\ntouch %s/recovery.signal\n",
-		pgdataPath, autoConf, pgdataPath,
-	)
-
-	cmd := exec.Command(
-		"docker", "run", "--rm",
-		"--volumes-from", targetContainer,
-		"-u", "postgres",
-		image,
-		"bash", "-c", script,
-	)
-
-	cmd.Stderr = os.Stderr
-
-	return cmd.Run()
-}
-
-// escapeSingleQuote escapes single quotes for postgres conf
-// string literals (doubled quote convention).
-func escapeSingleQuote(s string) string {
-	out := make([]rune, 0, len(s)+2)
-
-	for _, r := range s {
-		if r == '\'' {
-			out = append(out, '\'', '\'')
-			continue
-		}
-
-		out = append(out, r)
-	}
-
-	return string(out)
-}

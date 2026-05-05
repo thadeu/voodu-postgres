@@ -711,13 +711,12 @@ func TestStripPluginOwnedFields(t *testing.T) {
 		"initdb_encoding":  "UTF8",
 		"pg_config":        map[string]any{"max_connections": 200},
 		"extensions":       []any{"pgvector"},
-		"wal_archive":      map[string]any{"enabled": true},
 		"replication_user": "replicator",
 	}
 
 	stripPluginOwnedFields(merged)
 
-	stripped := []string{"database", "user", "password", "port", "initdb_locale", "initdb_encoding", "pg_config", "extensions", "wal_archive", "replication_user"}
+	stripped := []string{"database", "user", "password", "port", "initdb_locale", "initdb_encoding", "pg_config", "extensions", "replication_user"}
 
 	for _, k := range stripped {
 		if _, present := merged[k]; present {
