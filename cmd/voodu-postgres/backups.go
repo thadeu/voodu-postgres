@@ -372,11 +372,15 @@ func composeBackupContainerPrefix(scope, name string) string {
 // name produced for a backup capture. Two shapes accepted:
 //
 //   - "<prefix>bNNN"            (Caminho A: docker run -d direct)
-//   - "<prefix>bNNN-<runID>"    (Caminho B: voodu jobs, runID
-//                                appended by containers.ContainerName)
+//   - "<prefix>bNNN.<runID>"    (Caminho B: voodu jobs, runID
+//                                appended by containers.ContainerName
+//                                with `.` as separator)
 //
-// Both end up keying the same logical backup; the runID suffix is
-// voodu's audit-trail discriminator that we don't care about here.
+// Voodu's containers.ContainerName uses `.` between the AppID and
+// the replica/run id (e.g. `clowk-lp-db.0`,
+// `clowk-lp-db-backup-b011.fccd`). The Caminho A path used `-`
+// historically; we accept both for safety so legacy containers
+// from --follow captures still resolve.
 //
 // Returns ok=false for names that don't match either pattern
 // (defensive — operator might've manually created an unrelated
@@ -402,11 +406,17 @@ func parseContainerNameForID(name, prefix string) (int, bool) {
 		return 0, false
 	}
 
-	// Reject if there's a non-hyphen, non-end suffix after the
-	// digits. "b008abc" isn't a valid voodu run name (would be
-	// "b008-abc") so we don't want it parsing as id=8.
-	if end < len(digits) && digits[end] != '-' {
-		return 0, false
+	// After the digits, we expect either:
+	//   - end of string (Caminho A exact match: "<prefix>bNNN")
+	//   - "." (Caminho B voodu jobs: "<prefix>bNNN.<runID>")
+	//   - "-" (legacy / hand-rolled docker run -d: "<prefix>bNNN-<runID>")
+	// Anything else (e.g. "b008abc") is not a valid run name; reject
+	// to avoid spurious matches.
+	if end < len(digits) {
+		sep := digits[end]
+		if sep != '.' && sep != '-' {
+			return 0, false
+		}
 	}
 
 	n, err := strconv.Atoi(digits[:end])

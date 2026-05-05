@@ -882,9 +882,17 @@ func TestParseContainerNameForID(t *testing.T) {
 		wantID  int
 		wantOK  bool
 	}{
+		// Caminho A — exact match (--follow path, docker run -d direct)
 		{"clowk-lp-db-backup-b001", 1, true},
 		{"clowk-lp-db-backup-b042", 42, true},
 		{"clowk-lp-db-backup-b1000", 1000, true},
+		// Caminho B — voodu jobs use `.` between AppID and runID
+		// (containers.ContainerName convention)
+		{"clowk-lp-db-backup-b011.fccd", 11, true},
+		{"clowk-lp-db-backup-b042.abcd1234", 42, true},
+		{"clowk-lp-db-backup-b1000.xyz", 1000, true},
+		// Legacy/hand-rolled `-` separator also accepted for safety
+		{"clowk-lp-db-backup-b007-runidv2", 7, true},
 		// wrong prefix
 		{"other-scope-db-backup-b001", 0, false},
 		// missing 'b' marker
@@ -893,6 +901,8 @@ func TestParseContainerNameForID(t *testing.T) {
 		{"clowk-lp-db-backup-bxyz", 0, false},
 		// empty after prefix
 		{"clowk-lp-db-backup-", 0, false},
+		// digits followed by non-separator junk → reject (not a valid run name)
+		{"clowk-lp-db-backup-b008xyz", 0, false},
 	}
 
 	for _, tc := range cases {
