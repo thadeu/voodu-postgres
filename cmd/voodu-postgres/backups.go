@@ -1900,6 +1900,11 @@ func cmdBackupsDownload() error {
 				RemotePath: hostPath,
 				DestPath:   dest,
 				SizeBytes:  info.Size(),
+				// Operator-friendly checklist line — `b013 →
+				// bkp/db2.dump` instead of the verbose default
+				// (full host path + "deferred to CLI"). Same
+				// info, scannable in one glance.
+				Summary: fmt.Sprintf("fetch_file %s → %s", entry.Ref(), dest),
 			},
 		},
 	}

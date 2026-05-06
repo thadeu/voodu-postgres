@@ -158,6 +158,21 @@ type dispatchAction struct {
 	RemotePath string `json:"remote_path,omitempty"`
 	DestPath   string `json:"dest_path,omitempty"`
 	SizeBytes  int64  `json:"size_bytes,omitempty"`
+
+	// Summary is an optional human-readable label the plugin
+	// can attach to ANY action. Used by the controller as the
+	// `applied` line the CLI prints (e.g. `✓ <Summary>`). When
+	// empty, the controller composes a default summary from
+	// the action's structural fields (verbose but always works).
+	//
+	// Use case: keep the operator's checklist scannable. Default
+	// fetch_file summary is `fetch_file <full-remote-path> →
+	// <dest> (deferred to CLI)` — fine for debugging but noisy
+	// when the plugin already knows a short identifier (a backup
+	// ref like `b013`, an asset name, etc.). Plugins set Summary
+	// to the short form so the operator sees `fetch_file b013 →
+	// bkp/db2.dump` instead of the full host path.
+	Summary string `json:"summary,omitempty"`
 }
 
 // dispatchManifest is the wire shape for apply_manifest payloads.
