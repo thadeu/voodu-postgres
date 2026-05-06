@@ -874,6 +874,44 @@ func TestComposeBackupContainerPrefix(t *testing.T) {
 	}
 }
 
+// TestBackupContainerPrefixes_IncludesLegacy pins the back-compat
+// behaviour: listBackupContainers scans BOTH the current `.bk.`
+// shape AND the legacy `-backup-` shape, so containers spawned
+// before the rename remain discoverable by `:logs`, `:cancel`,
+// auto-prune, etc. Drop the legacy entry once enough time has
+// passed that no operator has old containers around.
+func TestBackupContainerPrefixes_IncludesLegacy(t *testing.T) {
+	cases := []struct {
+		scope, name      string
+		wantCurrent      string
+		wantLegacy       string
+	}{
+		{"clowk-lp", "db", "clowk-lp-db.bk.", "clowk-lp-db-backup-"},
+		{"", "db", "db.bk.", "db-backup-"},
+		{"data", "main", "data-main.bk.", "data-main-backup-"},
+	}
+
+	for _, tc := range cases {
+		got := backupContainerPrefixes(tc.scope, tc.name)
+
+		if len(got) != 2 {
+			t.Errorf("backupContainerPrefixes(%q, %q): got %d prefixes, want 2: %v",
+				tc.scope, tc.name, len(got), got)
+			continue
+		}
+
+		if got[0] != tc.wantCurrent {
+			t.Errorf("current prefix(%q,%q): got %q, want %q",
+				tc.scope, tc.name, got[0], tc.wantCurrent)
+		}
+
+		if got[1] != tc.wantLegacy {
+			t.Errorf("legacy prefix(%q,%q): got %q, want %q",
+				tc.scope, tc.name, got[1], tc.wantLegacy)
+		}
+	}
+}
+
 func TestComposeBackupJobName(t *testing.T) {
 	cases := []struct {
 		name string
@@ -941,6 +979,35 @@ func TestParseContainerNameForID(t *testing.T) {
 
 		if gotOK && gotID != tc.wantID {
 			t.Errorf("parseContainerNameForID(%q): id=%d, want %d", tc.name, gotID, tc.wantID)
+		}
+	}
+
+	// Same parser must work with the LEGACY `-backup-` prefix
+	// too — that's how the back-compat scan in
+	// listBackupContainers reaches old-format containers.
+	legacyPrefix := "clowk-lp-db-backup-"
+
+	legacyCases := []struct {
+		name   string
+		wantID int
+		wantOK bool
+	}{
+		{"clowk-lp-db-backup-b001", 1, true},
+		{"clowk-lp-db-backup-b012.ed52", 12, true},
+		{"clowk-lp-db-backup-b007-runidv2", 7, true},
+		{"other-prefix-b001", 0, false},
+	}
+
+	for _, tc := range legacyCases {
+		gotID, gotOK := parseContainerNameForID(tc.name, legacyPrefix)
+
+		if gotOK != tc.wantOK {
+			t.Errorf("legacy parseContainerNameForID(%q): ok=%v, want %v", tc.name, gotOK, tc.wantOK)
+			continue
+		}
+
+		if gotOK && gotID != tc.wantID {
+			t.Errorf("legacy parseContainerNameForID(%q): id=%d, want %d", tc.name, gotID, tc.wantID)
 		}
 	}
 }

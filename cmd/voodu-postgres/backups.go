@@ -465,12 +465,73 @@ type backupContainer struct {
 	ExitCode int    // 0 for running or success, non-zero for failure
 }
 
-// listBackupContainers runs `docker ps -a` filtered by the backup
-// prefix and returns one entry per matching container. State is the
-// docker-reported lifecycle phase.
-func listBackupContainers(scope, name string) ([]backupContainer, error) {
-	prefix := composeBackupContainerPrefix(scope, name)
+// backupContainerPrefixes returns every prefix shape under which
+// a backup container may have been created. The current shape is
+// canonical (composeBackupContainerPrefix); the legacy shape is
+// kept so containers from before the .bk. rename are still
+// discoverable by `vd pg:backups`, `:logs`, `:cancel`, etc. — until
+// the operator deletes the underlying backups (or the controllers
+// pruning catches up).
+//
+// New format: `<scope>-<name>.bk.` (e.g. clowk-lp-db.bk.b012.ed52)
+// Legacy:     `<scope>-<name>-backup-` (e.g. clowk-lp-db-backup-b012.ed52)
+//
+// Drop the legacy entry once no operator has containers in the old
+// shape — likely safe a few weeks/months after rollout.
+func backupContainerPrefixes(scope, name string) []string {
+	current := composeBackupContainerPrefix(scope, name)
 
+	var legacy string
+	if scope == "" {
+		legacy = name + "-backup-"
+	} else {
+		legacy = scope + "-" + name + "-backup-"
+	}
+
+	return []string{current, legacy}
+}
+
+// listBackupContainers runs `docker ps -a` once per known backup
+// container prefix shape and returns the merged list. Multiple
+// prefix scans cover the rename: containers spawned before the
+// `.bk.` rename used `-backup-` and are otherwise invisible to
+// the new parser; widening the scan keeps `:logs`, `:cancel`, and
+// the auto-prune path working across the migration.
+func listBackupContainers(scope, name string) ([]backupContainer, error) {
+	var entries []backupContainer
+
+	seen := map[string]bool{}
+
+	for _, prefix := range backupContainerPrefixes(scope, name) {
+		batch, err := listBackupContainersForPrefix(prefix)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, c := range batch {
+			if seen[c.Name] {
+				// Defensive: a container could match both prefixes
+				// only if a future rename uses both as substrings.
+				// Today they're disjoint so this branch is dead
+				// weight, but cheap to keep against drift.
+				continue
+			}
+
+			seen[c.Name] = true
+
+			entries = append(entries, c)
+		}
+	}
+
+	return entries, nil
+}
+
+// listBackupContainersForPrefix is the single-prefix worker that
+// listBackupContainers fans out to. Pulled out so each prefix
+// scan has its own parser instance — necessary because
+// parseContainerNameForID strips a SPECIFIC prefix from each
+// candidate container name.
+func listBackupContainersForPrefix(prefix string) ([]backupContainer, error) {
 	cmd := exec.Command("docker", "ps", "-a",
 		"--filter", "name="+prefix,
 		"--format", "{{.Names}}\t{{.State}}\t{{.Status}}",
@@ -1968,10 +2029,27 @@ func cmdBackupsLogs() error {
 	logsArgs = append(logsArgs, jobContainer)
 
 	cmd := exec.Command("docker", logsArgs...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
 
-	return cmd.Run()
+	// Merge docker's stderr into stdout. Failed pg_dump runs write
+	// the error message (e.g. "FATAL: password authentication
+	// failed") to the container's stderr — `docker logs` keeps that
+	// stream split, and the plugin's stderr is captured separately
+	// by the controller and only surfaced on plugin non-zero exit.
+	// We exit 0 here (we DID find the container and ran logs),
+	// so without merging the operator sees an empty response. Pin
+	// this with TestBackupsLogsMergesStderrIntoStdout.
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stdout
+
+	if err := cmd.Run(); err != nil {
+		// docker logs itself failing is rare — usually means the
+		// container vanished between listBackupContainers and the
+		// logs call. Surface the error rather than silently
+		// returning empty.
+		return fmt.Errorf("docker logs %s: %w", jobContainer, err)
+	}
+
+	return nil
 }
 
 // parseFollowFlag splits args into positional + the follow bool.
