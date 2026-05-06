@@ -262,8 +262,49 @@ if [ "$ORDINAL" != "$PRIMARY_ORDINAL" ]; then
     else
         log "PGDATA already populated + standby.signal present — resuming as standby (subsequent boot)"
     fi
+
+    # Runtime primary_conninfo. Written every boot so post-promote
+    # standbys point at the CURRENT primary without needing the
+    # asset re-rendered. The asset (voodu-50-streaming.conf, bind-
+    # mounted read-only) only carries static replication tunables;
+    # the dynamic line lives here in a writable PGDATA file.
+    #
+    # postgresql.conf will include_if_exists this file (wired by
+    # the include_dir step below); include_if_exists is read AFTER
+    # include_dir so this runtime value wins on conflict.
+    primary_fqdn="${PG_NAME:?PG_NAME is required}-${PRIMARY_ORDINAL}${PG_SCOPE_SUFFIX:-.voodu}"
+    repl_user="${PG_REPLICATION_USER:?PG_REPLICATION_USER is required}"
+    repl_pass="${PG_REPLICATION_PASSWORD:?PG_REPLICATION_PASSWORD is required}"
+
+    # Single-quote escaping in postgresql.conf string syntax: '' is
+    # a literal '. We never put a real ' in passwords (auto-gen is
+    # hex-only), but the substitution is correct in case of operator
+    # overrides.
+    escaped_pass="${repl_pass//\'/\'\'}"
+    runtime_conf="$PGDATA/voodu-runtime.conf"
+
+    cat > "$runtime_conf" <<EOF
+# Runtime primary_conninfo — rewritten by voodu-postgres wrapper at every
+# boot. Do not edit; changes are clobbered on next pod restart. To
+# change the primary, use 'vd postgres:promote <ref> --replica <N>'.
+primary_conninfo = 'host=${primary_fqdn} port=5432 user=${repl_user} password=${escaped_pass} application_name=voodu-postgres-standby'
+EOF
+
+    log "wrote primary_conninfo for $primary_fqdn to $runtime_conf"
 else
     log "role=PRIMARY (ordinal=$ORDINAL)"
+
+    # On the rare path where this pod was previously a STANDBY
+    # (post-promote: pg_promote() removed standby.signal but the
+    # runtime conf still has primary_conninfo from when this pod
+    # was a follower), drop the file. primary_conninfo without
+    # standby.signal is harmless but visually confusing in
+    # describe / pg_settings output.
+    runtime_conf="$PGDATA/voodu-runtime.conf"
+    if [ -f "$runtime_conf" ]; then
+        rm -f "$runtime_conf"
+        log "removed stale $runtime_conf (this pod is now PRIMARY)"
+    fi
 fi
 
 # Common from here: wire include_dir, symlink confs, hand off
@@ -297,6 +338,20 @@ if [ -f "$PGDATA/postgresql.conf" ]; then
             echo ""
             echo "# Added by voodu-postgres — picks up bind-mounted voodu-*.conf"
             echo "include_dir = '/etc/postgresql/conf.d'"
+        } >> "$PGDATA/postgresql.conf"
+    fi
+
+    # Runtime override file — primary_conninfo for standbys, written
+    # by the wrapper from env vars at every boot. Wired AFTER the
+    # asset include_dir so its values win on conflict (the asset
+    # doesn't set primary_conninfo today, but this future-proofs).
+    # PGDATA-relative path → resolves to $PGDATA/voodu-runtime.conf.
+    if ! grep -q "^include_if_exists = 'voodu-runtime.conf'" "$PGDATA/postgresql.conf"; then
+        log "wiring include_if_exists = 'voodu-runtime.conf' (runtime primary_conninfo) into postgresql.conf"
+        {
+            echo ""
+            echo "# Added by voodu-postgres — runtime primary_conninfo (wrapper-written at boot)"
+            echo "include_if_exists = 'voodu-runtime.conf'"
         } >> "$PGDATA/postgresql.conf"
     fi
 

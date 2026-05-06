@@ -135,13 +135,20 @@ func TestComposeScopeSuffix(t *testing.T) {
 	}
 }
 
-func TestRenderStreamingConf_PinsExpectedDirectives(t *testing.T) {
+// TestRenderStreamingConf_PinsStaticDirectives confirms the asset
+// only carries the static replication tunables. primary_conninfo
+// MOVED out of the asset (entrypoint wrapper writes it at boot
+// from env vars to PGDATA/voodu-runtime.conf) so that promotes
+// don't require re-rendering the asset to update the primary
+// pointer. The whole point of this redesign is captured by the
+// absence of primary_conninfo here — if a future refactor brings
+// it back, this test fails and pulls the lever.
+func TestRenderStreamingConf_PinsStaticDirectives(t *testing.T) {
 	got := renderStreamingConf("clowk-lp", "db", 0, "replicator", "deadbeef")
 
 	wantLines := []string{
 		"hot_standby = on",
 		"max_wal_senders = 10",
-		"primary_conninfo = ",
 		"wal_keep_size = '1GB'",
 	}
 
@@ -150,43 +157,47 @@ func TestRenderStreamingConf_PinsExpectedDirectives(t *testing.T) {
 			t.Errorf("missing %q in:\n%s", want, got)
 		}
 	}
-}
 
-func TestRenderStreamingConf_PrimaryConninfoIncludesFQDNAndPassword(t *testing.T) {
-	got := renderStreamingConf("clowk-lp", "db", 0, "replicator", "secretpass")
-
-	wantSubstrs := []string{
-		"host=db-0.clowk-lp.voodu",
-		"port=5432",
-		"user=replicator",
-		"password=secretpass",
-	}
-
-	for _, want := range wantSubstrs {
-		if !strings.Contains(got, want) {
-			t.Errorf("primary_conninfo missing %q in:\n%s", want, got)
-		}
+	// The DIRECTIVE form (`primary_conninfo = ...`) MUST NOT appear
+	// in the asset — that's the bug fix this redesign embodies.
+	// Baking the FQDN into the asset meant post-promote standbys
+	// streamed from the stale primary until `vd apply` re-rendered.
+	// The asset can MENTION primary_conninfo in a comment (which it
+	// does, explaining where the runtime version lives).
+	if strings.Contains(got, "primary_conninfo = ") {
+		t.Errorf("primary_conninfo directive leaked into static asset (must be wrapper-written at runtime):\n%s", got)
 	}
 }
 
-func TestRenderStreamingConf_PasswordWithQuoteEscaped(t *testing.T) {
-	// Defensive — operator-supplied passwords could include single
-	// quotes; auto-gen is hex-only but the renderer must handle
-	// quotes via the postgres-conf doubled-quote escape.
-	got := renderStreamingConf("s", "n", 0, "replicator", "pa'ss")
+// TestRenderStreamingConf_NoPrimaryOrdinalDependency proves the
+// asset content is INDEPENDENT of primary ordinal — different
+// ordinals must produce identical bytes. Together with the
+// absence of primary_conninfo above, this guarantees post-
+// promote behaviour: no asset re-render needed, the wrapper's
+// runtime file picks up the new primary from PG_PRIMARY_ORDINAL
+// env on the next boot.
+func TestRenderStreamingConf_NoPrimaryOrdinalDependency(t *testing.T) {
+	a := renderStreamingConf("scope", "name", 0, "replicator", "pw")
+	b := renderStreamingConf("scope", "name", 1, "replicator", "pw")
+	c := renderStreamingConf("scope", "name", 7, "replicator", "pw")
 
-	if !strings.Contains(got, "password=pa''ss") {
-		t.Errorf("expected pa''ss escape in primary_conninfo:\n%s", got)
+	if a != b || b != c {
+		t.Errorf("asset content must be ordinal-independent:\nord=0: %s\nord=1: %s\nord=7: %s", a, b, c)
 	}
 }
 
-func TestRenderStreamingConf_HonoursPrimaryOrdinal(t *testing.T) {
-	// M-P5 failover flips PG_PRIMARY_ORDINAL via config_set; the
-	// next expand re-renders streaming_conf with the new FQDN.
-	got := renderStreamingConf("scope", "name", 2, "replicator", "pw")
+// TestRenderStreamingConf_NoPasswordDependency: same as above but
+// for replication credentials. Wrapper writes them at runtime
+// from env vars (PG_REPLICATION_USER / PG_REPLICATION_PASSWORD),
+// so passing different values to the asset renderer must produce
+// identical bytes. Catches accidental regression where someone
+// puts the credentials back into the asset.
+func TestRenderStreamingConf_NoPasswordDependency(t *testing.T) {
+	a := renderStreamingConf("s", "n", 0, "r1", "secret-1")
+	b := renderStreamingConf("s", "n", 0, "r2", "secret-2")
 
-	if !strings.Contains(got, "host=name-2.scope.voodu") {
-		t.Errorf("primary_conninfo should target ordinal 2 FQDN:\n%s", got)
+	if a != b {
+		t.Errorf("asset must not embed replication credentials:\na: %s\nb: %s", a, b)
 	}
 }
 
