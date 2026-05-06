@@ -739,16 +739,26 @@ func reportCaptureProgress(container, file string, estDumpBytes int64, done <-ch
 // commands
 // ─────────────────────────────────────────────────────────────────
 
-const backupsListHelp = `vd pg:backups — list backups for a postgres resource.
+const backupsListHelp = `vd pg:backups — list postgres backups.
 
 USAGE
-  vd pg:backups <postgres-scope/name> [-o text|json]
+  vd pg:backups                            # every cluster on this host
+  vd pg:backups <scope>                    # every cluster in a scope
+  vd pg:backups <scope>/<name>             # a single cluster
+  vd pg:backups [...] [-o text|json]
 
 ARGUMENTS
-  <postgres-scope/name>   The postgres resource.
+  <scope>                Lists every postgres cluster declared under
+                         this scope. Discovered by walking
+                         /opt/voodu/backups/<scope>/. No-clusters scope
+                         emits an empty list.
+  <scope>/<name>         A specific postgres resource.
+  (no argument)          Discovers every cluster across every scope on
+                         this host and lists each in its own block.
+                         Useful when you forgot the scope name.
 
 FLAGS
-  -o, --output            'text' (default, table) or 'json' (jq-friendly)
+  -o, --output           'text' (default, table) or 'json' (jq-friendly)
 
 STATUS COLUMN
   running    A backup container is currently running. Size grows
@@ -758,25 +768,41 @@ STATUS COLUMN
              partial file. Container is still around for log
              inspection (auto-pruned by the next capture).
 
-OUTPUT (text)
-  ID     Status     Created at            Size
-  b007   complete   2026-05-04T02:00:00Z  245.3 MB
-  b008   running    2026-05-05T14:30:00Z  87.0 MB
+OUTPUT (text, multi-cluster)
+  === Backups for clowk-lp/db
+    ID     Status     Created at            Size
+    b007   complete   2026-05-04T02:00:00Z  245.3 MB
+
+  === Backups for prod/main
+    (no backups yet)
+    → vd pg:backups:capture prod/main
+
+DISCOVERY
+  Cluster list is sourced from the /opt/voodu/backups host directory:
+  any (scope, name) pair that has a directory there is listed, even
+  if the postgres pod isn't currently running. New clusters appear
+  after their first backup capture.
 
 EXAMPLES
-  vd pg:backups clowk-lp/db
-  vd pg:backups clowk-lp/db -o json | jq '.backups[] | .id'
+  vd pg:backups                            # everything
+  vd pg:backups clowk-lp                   # everything in clowk-lp
+  vd pg:backups clowk-lp/db                # just clowk-lp/db
+  vd pg:backups -o json | jq 'keys'        # cluster refs as JSON keys
 `
 
-// cmdBackups lists backups for a postgres resource. Combines two
-// data sources:
+// cmdBackups lists backups for postgres clusters. Three shapes:
 //
-//   - Files in /backups/ (read via host bind-mount — works without
-//     a running pod) → completed captures.
-//   - `docker ps -a` filtered by the backup container prefix →
-//     in-progress + recently-failed captures.
+//   - no arg:        every cluster discovered on /opt/voodu/backups/
+//   - <scope>:       every cluster under that scope
+//   - <scope>/<name>: a single cluster (the original M-P3 surface)
 //
-// Status reflects which of those a given bNNN appears in.
+// The discovery shapes (no arg / scope only) walk the host backups
+// directory — any (scope, name) pair with a dir there counts. New
+// clusters appear after their first capture; clusters with no
+// backup history don't show up. That's the right tradeoff for
+// "vd pg:backups" the operator runs to find a cluster name they
+// forgot — clusters that have never been backed up don't need
+// listing here either way.
 func cmdBackups() error {
 	args := os.Args[2:]
 
@@ -787,15 +813,58 @@ func cmdBackups() error {
 
 	positional, asJSON := parseInfoFlags(args)
 
-	if len(positional) < 1 {
-		return fmt.Errorf("usage: vd pg:backups <postgres-scope/name> [-o json]")
+	// Shape 1: bare `vd pg:backups` — discover every cluster.
+	if len(positional) == 0 {
+		clusters, err := discoverBackupClusters("")
+		if err != nil {
+			return fmt.Errorf("discover clusters: %w", err)
+		}
+
+		return listBackupsForClusters(clusters, asJSON)
 	}
 
-	scope, name := splitScopeName(positional[0])
+	ref := positional[0]
+
+	// Shape 2: scope-only — bare token (no `/`). We split on the
+	// presence of slash directly because splitScopeName treats a
+	// bare token as the NAME (with empty scope) — that convention
+	// fits 1-label HCL kinds but doesn't match the operator's
+	// mental model when typing `vd pg:backups clowk-lp` to list a
+	// scope.
+	if !strings.Contains(ref, "/") {
+		clusters, err := discoverBackupClusters(ref)
+		if err != nil {
+			return fmt.Errorf("discover clusters in scope %q: %w", ref, err)
+		}
+
+		if len(clusters) == 0 {
+			if asJSON {
+				return emitBackupsMultiJSON(nil)
+			}
+
+			fmt.Printf("=== Backups for scope %s\n\n", ref)
+			fmt.Println("  (no postgres backups under this scope on this host)")
+			fmt.Println()
+
+			return nil
+		}
+
+		return listBackupsForClusters(clusters, asJSON)
+	}
+
+	// Shape 3: <scope>/<name> — single cluster (legacy path).
+	scope, name := splitScopeName(ref)
 	if name == "" {
-		return fmt.Errorf("invalid ref %q (expected scope/name)", positional[0])
+		return fmt.Errorf("invalid ref %q (expected scope/name)", ref)
 	}
 
+	return listBackupsForCluster(scope, name, asJSON)
+}
+
+// listBackupsForCluster handles the single-cluster shape. Pulled
+// out so cmdBackups stays focused on the dispatch and the
+// multi-cluster path can call it per-cluster too.
+func listBackupsForCluster(scope, name string, asJSON bool) error {
 	files, err := listBackupsOnHost(scope, name)
 	if err != nil {
 		return fmt.Errorf("list /backups dir: %w", err)
@@ -818,6 +887,192 @@ func cmdBackups() error {
 	emitBackupsText(scope, name, rows)
 
 	return nil
+}
+
+// listBackupsForClusters renders multiple clusters in one go.
+// Text output: each cluster gets its own `=== Backups for <ref>`
+// block with a blank line separator. JSON output: a single object
+// keyed by ref so `jq 'keys'` gives the cluster list.
+func listBackupsForClusters(clusters []backupCluster, asJSON bool) error {
+	if asJSON {
+		acc := make(map[string][]backupListEntry, len(clusters))
+
+		for _, c := range clusters {
+			rows, err := loadClusterBackups(c.Scope, c.Name)
+			if err != nil {
+				return err
+			}
+
+			acc[refOrName(c.Scope, c.Name)] = rows
+		}
+
+		return emitBackupsMultiJSON(acc)
+	}
+
+	if len(clusters) == 0 {
+		fmt.Println("(no postgres clusters with backups found on this host)")
+		fmt.Println()
+		fmt.Println("Capture one with: vd pg:backups:capture <scope>/<name>")
+
+		return nil
+	}
+
+	for i, c := range clusters {
+		rows, err := loadClusterBackups(c.Scope, c.Name)
+		if err != nil {
+			return err
+		}
+
+		if i > 0 {
+			fmt.Println()
+		}
+
+		emitBackupsText(c.Scope, c.Name, rows)
+	}
+
+	return nil
+}
+
+// loadClusterBackups merges file + container listings for one
+// cluster. Same body as the inner part of listBackupsForCluster
+// but returns rows for callers that compose multi-cluster output
+// themselves.
+func loadClusterBackups(scope, name string) ([]backupListEntry, error) {
+	files, err := listBackupsOnHost(scope, name)
+	if err != nil {
+		return nil, fmt.Errorf("list /backups for %s: %w", refOrName(scope, name), err)
+	}
+
+	containers, err := listBackupContainers(scope, name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warn: docker ps for %s backup containers: %v\n",
+			refOrName(scope, name), err)
+
+		containers = nil
+	}
+
+	return mergeBackupListing(files, containers), nil
+}
+
+// backupCluster is the (scope, name) pair the discovery walk
+// returns. Sorted by scope then name so multi-cluster output is
+// deterministic across runs (operators can grep / diff confidently).
+type backupCluster struct {
+	Scope string
+	Name  string
+}
+
+// discoverBackupClusters walks /opt/voodu/backups looking for the
+// `<scope>/<name>/` shape. When `scopeFilter` is empty, all scopes
+// are scanned; otherwise only the named scope. Unscoped resources
+// land under `_unscoped/<name>/` and are surfaced with Scope="" so
+// downstream rendering uses the same path conventions as
+// composeBackupHostPath.
+//
+// Best-effort: missing directories return an empty slice + nil
+// error (a fresh host has no backups dir at all). I/O errors that
+// aren't "not found" propagate so the operator sees real problems.
+func discoverBackupClusters(scopeFilter string) ([]backupCluster, error) {
+	scopes, err := os.ReadDir(backupsHostRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+
+		return nil, fmt.Errorf("read %s: %w", backupsHostRoot, err)
+	}
+
+	var out []backupCluster
+
+	for _, s := range scopes {
+		if !s.IsDir() {
+			continue
+		}
+
+		scopeDir := s.Name()
+
+		// _unscoped is the magic dir for resources without a scope
+		// (composeBackupHostPath puts them there). Surface as
+		// Scope="" so refOrName picks the right shape downstream.
+		scopeKey := scopeDir
+		if scopeDir == "_unscoped" {
+			scopeKey = ""
+		}
+
+		if scopeFilter != "" && scopeKey != scopeFilter {
+			continue
+		}
+
+		names, err := os.ReadDir(backupsHostRoot + "/" + scopeDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warn: read %s/%s: %v\n", backupsHostRoot, scopeDir, err)
+			continue
+		}
+
+		for _, n := range names {
+			if !n.IsDir() {
+				continue
+			}
+
+			out = append(out, backupCluster{Scope: scopeKey, Name: n.Name()})
+		}
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Scope != out[j].Scope {
+			return out[i].Scope < out[j].Scope
+		}
+
+		return out[i].Name < out[j].Name
+	})
+
+	return out, nil
+}
+
+// emitBackupsMultiJSON renders the multi-cluster shape as a JSON
+// object keyed by cluster ref. Lets `jq 'keys'` pull the list of
+// clusters with backups for scripting.
+func emitBackupsMultiJSON(byRef map[string][]backupListEntry) error {
+	type rowOut struct {
+		ID        string `json:"id"`
+		Status    string `json:"status"`
+		Filename  string `json:"filename,omitempty"`
+		CreatedAt string `json:"created_at,omitempty"`
+		SizeBytes int64  `json:"size_bytes"`
+	}
+
+	out := make(map[string][]rowOut, len(byRef))
+
+	for ref, rows := range byRef {
+		converted := make([]rowOut, 0, len(rows))
+
+		for _, r := range rows {
+			id := fmt.Sprintf("b%03d", r.ID)
+			if r.ID >= 1000 {
+				id = fmt.Sprintf("b%d", r.ID)
+			}
+
+			row := rowOut{
+				ID:        id,
+				Status:    r.Status,
+				Filename:  r.Filename,
+				SizeBytes: r.SizeBytes,
+			}
+
+			if !r.Timestamp.IsZero() {
+				row.CreatedAt = r.Timestamp.UTC().Format(time.RFC3339)
+			}
+
+			converted = append(converted, row)
+		}
+
+		out[ref] = converted
+	}
+
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+
+	return enc.Encode(out)
 }
 
 // backupListEntry is the merged view of a backup — file metadata
