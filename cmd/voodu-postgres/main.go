@@ -207,7 +207,7 @@ type expandedPayload struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		emitErr("usage: voodu-postgres <expand|link|unlink|new-password|info|expose|unexpose|promote|rejoin|psql|backup|restore|backups|backups:capture|backups:restore|backups:download|backups:delete|backups:schedule|backups:cancel|backups:logs|backups:prune|defaults|help|--version>")
+		emitErr("usage: voodu-postgres <expand|link|unlink|new-password|info|expose|unexpose|promote|rejoin|psql|backups|backups:capture|backups:restore|backups:download|backups:delete|backups:schedule|backups:cancel|backups:logs|backups:prune|defaults|help|--version>")
 		os.Exit(1)
 	}
 
@@ -283,18 +283,6 @@ func main() {
 		// it succeeds, the process is replaced and main never
 		// returns.
 		if err := cmdPsql(); err != nil {
-			emitErr(err.Error())
-			os.Exit(1)
-		}
-
-	case "backup":
-		if err := cmdBackup(); err != nil {
-			emitErr(err.Error())
-			os.Exit(1)
-		}
-
-	case "restore":
-		if err := cmdRestore(); err != nil {
 			emitErr(err.Error())
 			os.Exit(1)
 		}
@@ -376,7 +364,7 @@ func main() {
 		printPluginOverview()
 
 	default:
-		emitErr(fmt.Sprintf("unknown subcommand %q (want expand|link|unlink|new-password|info|expose|unexpose|promote|rejoin|psql|backup|restore|backups|backups:capture|backups:restore|backups:download|backups:delete|backups:schedule|backups:cancel|backups:logs|backups:prune|defaults|help)", os.Args[1]))
+		emitErr(fmt.Sprintf("unknown subcommand %q (want expand|link|unlink|new-password|info|expose|unexpose|promote|rejoin|psql|backups|backups:capture|backups:restore|backups:download|backups:delete|backups:schedule|backups:cancel|backups:logs|backups:prune|defaults|help)", os.Args[1]))
 		os.Exit(1)
 	}
 }

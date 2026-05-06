@@ -89,6 +89,21 @@ NOTES
   - Operator firewall rules (ufw, security groups, iptables) still
     apply — exposing inside the container ≠ open from the Internet
     if the host blocks the port.
+
+HA / REPLICAS
+  Refused when replicas > 1. Voodu's statefulset reconciler applies
+  spec.Ports uniformly to every pod (no per-ordinal port maps), so
+  binding 0.0.0.0:<port> on multiple pods produces a host-port
+  conflict — only the first pod boots, the others fail.
+
+  For HA clusters, expose via:
+    1. pgbouncer (or HAProxy / nginx-stream) fronting the cluster
+       on a single dedicated host port. Pods stay loopback-only;
+       the proxy is the single external listener.
+    2. SSH tunnel from your machine to the primary FQDN
+       (db-0.<scope>.voodu:5432) — fine for ad-hoc access.
+    3. Temporarily scale to replicas=1, expose, do the work,
+       scale back. Lossy if you depend on standby uptime.
 `
 
 const unexposeHelp = `vd postgres:unexpose — un-publish postgres back to 127.0.0.1 (loopback only).
@@ -206,6 +221,16 @@ func cmdUnexpose() error {
 // (preserves state across applies); apply_manifest is the
 // imperative path that takes effect immediately without waiting
 // for a re-apply.
+//
+// HA constraint: voodu's statefulset reconciler applies
+// spec.Ports uniformly to every pod (no per-ordinal port maps
+// today). With replicas > 1, binding 0.0.0.0:<port> on every pod
+// causes the second pod to fail at startup with "port already in
+// use". We refuse expose in that case and point the operator at
+// safer alternatives — pgbouncer fronting the cluster, an SSH
+// tunnel from the operator's box, or a separate read-replica
+// service. unexpose stays unconditional because rolling back to
+// loopback is always safe regardless of replica count.
 func composeExposeActions(scope, name string, exposed bool) ([]dispatchAction, error) {
 	ctx, err := readInvocationContext()
 	if err != nil {
@@ -221,6 +246,20 @@ func composeExposeActions(scope, name string, exposed bool) ([]dispatchAction, e
 	spec, err := client.fetchSpec("statefulset", scope, name)
 	if err != nil {
 		return nil, fmt.Errorf("describe %s: %w", refOrName(scope, name), err)
+	}
+
+	if exposed {
+		replicas := readReplicas(spec)
+		if replicas > 1 {
+			return nil, fmt.Errorf(
+				"expose refused: postgres %s has replicas=%d; binding 0.0.0.0:<port> on every pod produces a port-conflict at boot.\n\n"+
+					"Workarounds:\n"+
+					"  1. Front the cluster with pgbouncer (or another TCP proxy) on a dedicated host port.\n"+
+					"     The proxy keeps a single external listener; pods stay loopback-only.\n"+
+					"  2. Open an SSH tunnel from your machine to db-0.%s.voodu:5432 for ad-hoc access.\n"+
+					"  3. Scale to replicas=1 temporarily if you only need a writer endpoint.\n",
+				refOrName(scope, name), replicas, scope)
+		}
 	}
 
 	port := readPortInt(spec)

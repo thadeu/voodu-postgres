@@ -1907,6 +1907,21 @@ func isHTTPURL(s string) bool {
 	return strings.HasPrefix(s, "https://") || strings.HasPrefix(s, "http://")
 }
 
+// dockerCpToContainer copies a host path into a running container
+// at dstPath. Used by the URL-restore path in cmdBackupsRestore so
+// the downloaded file lands inside the primary pod where pg_restore
+// can read it via /tmp/<random>.dump.
+//
+// Inherited from the now-removed legacy backup/restore commands.
+// Kept inline next to its only remaining caller; if a future
+// command needs it too, lift to a shared helper file.
+func dockerCpToContainer(hostPath, container, dstPath string) error {
+	cmd := exec.Command("docker", "cp", hostPath, container+":"+dstPath)
+	cmd.Stderr = os.Stderr
+
+	return cmd.Run()
+}
+
 // downloadURLToTempFile streams a URL to a host temp file. Returns
 // the temp path + bytes copied. Caller is responsible for removing
 // the temp file when done (cleanup happens via the closure inside

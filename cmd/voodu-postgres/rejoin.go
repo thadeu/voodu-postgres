@@ -361,6 +361,16 @@ func dockerStart(name string) error {
 // shares the target's PGDATA volume via --volumes-from. PGPASSWORD
 // flows in as an env var so the secret doesn't ride on argv (where
 // `docker inspect` and `ps -ef` would surface it).
+//
+// Network: we attach to voodu0 (the always-present bridge) so
+// pg_rewind can resolve <pod>.<scope>.voodu via voodu0's embedded
+// DNS and reach the new primary. Earlier we used `--network
+// container:<target>` but that fails — pg_rewind requires the
+// target stopped, and docker rejects joining a stopped container's
+// network namespace ("cannot join network namespace of a non
+// running container"). voodu0 directly avoids that bind: every
+// voodu pod is on voodu0 by platform invariant, so reaching the
+// new primary at db-N.scope.voodu just works.
 func dockerRunPgRewind(targetContainer, image, pgdataPath, primaryFQDN string, port int, user, password string) error {
 	sourceConn := fmt.Sprintf("host=%s port=%d user=%s dbname=postgres",
 		primaryFQDN, port, user)
@@ -369,10 +379,7 @@ func dockerRunPgRewind(targetContainer, image, pgdataPath, primaryFQDN string, p
 		"docker", "run", "--rm",
 		"--volumes-from", targetContainer,
 		"-e", "PGPASSWORD="+password,
-		// pg_rewind also dials the primary to fetch WAL — needs
-		// the same network the target was on, so it can resolve
-		// db-N.scope.voodu via voodu0's embedded DNS.
-		"--network", "container:"+targetContainer,
+		"--network", "voodu0",
 		image,
 		"pg_rewind",
 		"--target-pgdata="+pgdataPath,
