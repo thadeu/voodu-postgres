@@ -840,11 +840,11 @@ func TestComposeBackupContainerName(t *testing.T) {
 		id          int
 		want        string
 	}{
-		{"clowk-lp", "db", 1, "clowk-lp-db-backup-b001"},
-		{"clowk-lp", "db", 42, "clowk-lp-db-backup-b042"},
-		{"clowk-lp", "db", 1000, "clowk-lp-db-backup-b1000"},
-		{"", "db", 7, "db-backup-b007"},
-		{"data", "main", 99, "data-main-backup-b099"},
+		{"clowk-lp", "db", 1, "clowk-lp-db.bk.b001"},
+		{"clowk-lp", "db", 42, "clowk-lp-db.bk.b042"},
+		{"clowk-lp", "db", 1000, "clowk-lp-db.bk.b1000"},
+		{"", "db", 7, "db.bk.b007"},
+		{"data", "main", 99, "data-main.bk.b099"},
 	}
 
 	for _, tc := range cases {
@@ -860,9 +860,9 @@ func TestComposeBackupContainerPrefix(t *testing.T) {
 	cases := []struct {
 		scope, name, want string
 	}{
-		{"clowk-lp", "db", "clowk-lp-db-backup-"},
-		{"", "db", "db-backup-"},
-		{"data", "main", "data-main-backup-"},
+		{"clowk-lp", "db", "clowk-lp-db.bk."},
+		{"", "db", "db.bk."},
+		{"data", "main", "data-main.bk."},
 	}
 
 	for _, tc := range cases {
@@ -874,8 +874,34 @@ func TestComposeBackupContainerPrefix(t *testing.T) {
 	}
 }
 
+func TestComposeBackupJobName(t *testing.T) {
+	cases := []struct {
+		name string
+		id   int
+		want string
+	}{
+		// Job manifest name carries the .bk.bNNN suffix; voodu's
+		// containers.ContainerName then prepends scope-name-* and
+		// appends .runID to produce the full container name.
+		{"db", 1, "db.bk.b001"},
+		{"db", 11, "db.bk.b011"},
+		{"db", 1000, "db.bk.b1000"},
+		{"main", 99, "main.bk.b099"},
+	}
+
+	for _, tc := range cases {
+		got := composeBackupJobName(tc.name, tc.id)
+		if got != tc.want {
+			t.Errorf("composeBackupJobName(%q, %d): got %q, want %q",
+				tc.name, tc.id, got, tc.want)
+		}
+	}
+}
+
 func TestParseContainerNameForID(t *testing.T) {
-	prefix := "clowk-lp-db-backup-"
+	// New convention: `<scope>-<name>.bk.bNNN[.<runID>]`.
+	// Prefix ends in `.bk.` (with trailing dot).
+	prefix := "clowk-lp-db.bk."
 
 	cases := []struct {
 		name    string
@@ -883,26 +909,26 @@ func TestParseContainerNameForID(t *testing.T) {
 		wantOK  bool
 	}{
 		// Caminho A — exact match (--follow path, docker run -d direct)
-		{"clowk-lp-db-backup-b001", 1, true},
-		{"clowk-lp-db-backup-b042", 42, true},
-		{"clowk-lp-db-backup-b1000", 1000, true},
-		// Caminho B — voodu jobs use `.` between AppID and runID
-		// (containers.ContainerName convention)
-		{"clowk-lp-db-backup-b011.fccd", 11, true},
-		{"clowk-lp-db-backup-b042.abcd1234", 42, true},
-		{"clowk-lp-db-backup-b1000.xyz", 1000, true},
+		{"clowk-lp-db.bk.b001", 1, true},
+		{"clowk-lp-db.bk.b042", 42, true},
+		{"clowk-lp-db.bk.b1000", 1000, true},
+		// Caminho B — voodu jobs append `.runID` (containers.ContainerName)
+		{"clowk-lp-db.bk.b011.fccd", 11, true},
+		{"clowk-lp-db.bk.b042.abcd1234", 42, true},
+		{"clowk-lp-db.bk.b1000.xyz", 1000, true},
 		// Legacy/hand-rolled `-` separator also accepted for safety
-		{"clowk-lp-db-backup-b007-runidv2", 7, true},
-		// wrong prefix
-		{"other-scope-db-backup-b001", 0, false},
+		{"clowk-lp-db.bk.b007-runidv2", 7, true},
+		// wrong prefix (different scope or different category)
+		{"other-scope-db.bk.b001", 0, false},
+		{"clowk-lp-db.rs.b001", 0, false},
 		// missing 'b' marker
-		{"clowk-lp-db-backup-001", 0, false},
+		{"clowk-lp-db.bk.001", 0, false},
 		// non-numeric tail
-		{"clowk-lp-db-backup-bxyz", 0, false},
+		{"clowk-lp-db.bk.bxyz", 0, false},
 		// empty after prefix
-		{"clowk-lp-db-backup-", 0, false},
+		{"clowk-lp-db.bk.", 0, false},
 		// digits followed by non-separator junk → reject (not a valid run name)
-		{"clowk-lp-db-backup-b008xyz", 0, false},
+		{"clowk-lp-db.bk.b008xyz", 0, false},
 	}
 
 	for _, tc := range cases {

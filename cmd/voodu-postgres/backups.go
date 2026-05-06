@@ -341,12 +341,19 @@ func listBackupsOnHost(scope, name string) ([]backupEntry, error) {
 }
 
 // composeBackupContainerName builds the deterministic name for a
-// backup job container: `<scope>-<name>-backup-bNNN`. Sticking to
-// scope-prefixed naming so backups across resources don't collide
-// in the operator's `docker ps` output.
+// backup job container: `<scope>-<name>.bk.bNNN`. Mirrors voodu's
+// container naming (dot-separated AppID.replica) — putting the
+// `.bk` category in the JOB MANIFEST NAME so voodu's
+// containers.ContainerName auto-produces the dotted form when it
+// appends the runID:
 //
-// Unscoped resources use `<name>-backup-bNNN` (no leading dash, no
-// double-dash). Mirrors containerNameFor's unscoped handling.
+//	job manifest:  scope=clowk-lp, name=db.bk.b011
+//	container:     clowk-lp-db.bk.b011.<runID>
+//
+// Unscoped resources drop the leading scope segment (just
+// `<name>.bk.bNNN`). For Caminho A (docker run -d direct), no
+// runID is appended, so the container name IS the
+// composeBackupContainerName output.
 func composeBackupContainerName(scope, name string, id int) string {
 	prefix := composeBackupContainerPrefix(scope, name)
 
@@ -358,14 +365,34 @@ func composeBackupContainerName(scope, name string, id int) string {
 }
 
 // composeBackupContainerPrefix returns the prefix shared by all
-// backup containers for a (scope, name) pair: `<scope>-<name>-backup-`.
-// Useful for `docker ps --filter name=<prefix>` queries.
+// backup containers for a (scope, name) pair: `<scope>-<name>.bk.`
+// (note the trailing dot). Used for `docker ps --filter name=<prefix>`
+// scans and as the strip-prefix for parseContainerNameForID.
+//
+// The `.bk.` infix differentiates backup-related containers from
+// any other voodu container under the same scope/name (e.g.
+// statefulset replicas `<scope>-<name>.0`). Future categories
+// (e.g. `.rs.` for restore jobs, `.cl.` for cleanup) can plug in
+// without colliding.
 func composeBackupContainerPrefix(scope, name string) string {
 	if scope == "" {
-		return name + "-backup-"
+		return name + ".bk."
 	}
 
-	return scope + "-" + name + "-backup-"
+	return scope + "-" + name + ".bk."
+}
+
+// composeBackupJobName returns the JOB MANIFEST name (kind=job)
+// for a given backup. Voodu's containers.ContainerName takes
+// (scope, name, runID) and produces `<scope>-<name>.<runID>`, so
+// embedding `.bk.bNNN` in the name yields the desired
+// `<scope>-<name>.bk.bNNN.<runID>` container name automatically.
+func composeBackupJobName(name string, id int) string {
+	if id < 1000 {
+		return fmt.Sprintf("%s.bk.b%03d", name, id)
+	}
+
+	return fmt.Sprintf("%s.bk.b%d", name, id)
 }
 
 // parseContainerNameForID extracts the backup ID from a container
@@ -1082,7 +1109,7 @@ func cmdBackupsCapture() error {
 	// docker-run-direct path below for that reason.
 	// ------------------------------------------------------------
 	if !follow {
-		jobName := name + "-backup-" + entry.Ref()
+		jobName := composeBackupJobName(name, id)
 		sourceFQDN := composePrimaryFQDN(scope, name, source)
 
 		// pg_dump connects to the source pod via voodu0 DNS.
@@ -1101,6 +1128,15 @@ func cmdBackupsCapture() error {
 			},
 			"volumes": []any{
 				hostBackupsDir + ":" + backupsContainerPath + ":rw",
+			},
+			// voodu.role label categorises the container so future
+			// `vd jobs:list --role=backup` (or generic queries on
+			// label) work without depending on name parsing.
+			// Operators can also `docker ps --filter
+			// label=voodu.role=backup` to grep any in-flight backup
+			// across resources/scopes.
+			"labels": map[string]any{
+				"voodu.role": "backup",
 			},
 			// Cap history so etcd doesn't accumulate run records
 			// across many captures.
@@ -1158,6 +1194,10 @@ func cmdBackupsCapture() error {
 		"--network", "container:" + sourceContainer,
 		"-e", "PGPASSWORD=" + password,
 		"-v", hostBackupsDir + ":" + backupsContainerPath + ":rw",
+		// Same role label the Caminho B job spec carries — keeps
+		// `docker ps --filter label=voodu.role=backup` consistent
+		// across both code paths.
+		"--label", "voodu.role=backup",
 		image,
 		"bash", "-c", wrapper,
 	}
