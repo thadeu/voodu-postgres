@@ -147,6 +147,29 @@ log() { echo "voodu-postgres: $*" >&2; }
 if [ "$ORDINAL" != "$PRIMARY_ORDINAL" ]; then
     log "role=STANDBY (ordinal=$ORDINAL, primary=$PRIMARY_ORDINAL)"
 
+    # Bootstrap-in-progress sentinel. Set BEFORE pg_basebackup
+    # runs, removed AFTER standby.signal is armed and the bootstrap
+    # is complete. If the wrapper boots and finds this file, the
+    # previous attempt was killed mid-flight (host reboot, OOM,
+    # restart fan-out racing the rebootstrap, etc.) — PGDATA is in
+    # an undefined partial state. Wipe and retry.
+    #
+    # Without this self-healing, pg_basebackup interruptions leave
+    # PGDATA with PG_VERSION but no standby.signal → split-brain
+    # guard fires → restart loop → operator stuck. With it, the
+    # wrapper recovers automatically on the next boot.
+    bootstrap_sentinel="$PGDATA/.voodu-bootstrap-incomplete"
+
+    if [ -f "$bootstrap_sentinel" ]; then
+        log "bootstrap sentinel found — previous pg_basebackup was interrupted, wiping PGDATA contents and retrying"
+
+        # Delete every entry under PGDATA (files + dotfiles + dirs)
+        # but NOT the directory itself (it's the volume mount point;
+        # removing it would break the mount). find -mindepth 1
+        # excludes PGDATA itself.
+        find "$PGDATA" -mindepth 1 -delete 2>/dev/null || true
+    fi
+
     if [ ! -f "$PGDATA/PG_VERSION" ]; then
         # First-boot bootstrap: clone primary via pg_basebackup.
         # PGDATA must be empty for pg_basebackup to write into it
@@ -175,6 +198,12 @@ if [ "$ORDINAL" != "$PRIMARY_ORDINAL" ]; then
             sleep 5
         done
 
+        # Mark bootstrap as in-progress BEFORE pg_basebackup runs.
+        # Removed only after standby.signal is armed below; if the
+        # wrapper is killed in between, the sentinel's presence on
+        # the next boot triggers the wipe-and-retry above.
+        touch "$bootstrap_sentinel"
+
         log "running pg_basebackup -h $primary_fqdn -p $PG_PORT -U $repl_user -D $PGDATA"
         # -X stream: include WAL needed to make the backup
         #   self-consistent (no archive_command dependency)
@@ -184,7 +213,7 @@ if [ "$ORDINAL" != "$PRIMARY_ORDINAL" ]; then
         #   voodu-50-streaming.conf via include_dir, which lets
         #   the operator override it via pg_config.
         if ! pg_basebackup -h "$primary_fqdn" -p "$PG_PORT" -U "$repl_user" -D "$PGDATA" -X stream -P; then
-            log "pg_basebackup FAILED — leaving PGDATA empty so the next boot retries"
+            log "pg_basebackup FAILED — sentinel kept, next boot will wipe and retry"
             exit 1
         fi
 
@@ -195,6 +224,12 @@ if [ "$ORDINAL" != "$PRIMARY_ORDINAL" ]; then
         # data dir as a primary and refuse to follow upstream
         # WAL.
         touch "$PGDATA/standby.signal"
+
+        # Bootstrap complete — clear the sentinel so subsequent
+        # boots take the "subsequent boot" branch instead of
+        # wiping again.
+        rm -f "$bootstrap_sentinel"
+
         log "pg_basebackup complete + standby.signal armed"
     elif [ ! -f "$PGDATA/standby.signal" ]; then
         # M-P5 split-brain guard. PGDATA is populated AND we're
