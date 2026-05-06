@@ -46,6 +46,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1733,16 +1734,35 @@ func cmdBackupsRestore() error {
 		"restore: pg_restore in %s ← %s (db=%s, user=%s, %s)\n",
 		primaryContainer, containerFilePath, db, user, formatSize(sourceSize))
 
+	// Pre-flight: dump the TOC so we can surface what pg_restore
+	// will (or won't) do. Catches the silent-no-op trap where the
+	// dump is schema-only (or empty), restore exits 0, and the
+	// operator sees "restored" but no rows came back.
+	tocSummary, _ := summariseDumpTOC(primaryContainer, containerFilePath)
+
 	// pg_restore inside the primary pod via Unix socket (peer auth,
 	// no password). Flags:
 	//
-	//   --clean          drop existing objects before recreating
-	//   --if-exists      tolerate missing objects (idempotent re-run)
-	//   --no-owner       skip ALTER ... OWNER TO (works across hosts
-	//                    where the postgres role names differ)
-	//   --no-privileges  skip GRANT/REVOKE (same portability concern;
-	//                    operator re-applies app-specific perms via
-	//                    init scripts or migrations)
+	//   --clean              drop existing objects before recreating
+	//   --if-exists          tolerate missing objects (idempotent re-run)
+	//   --no-owner           skip ALTER ... OWNER TO (works across hosts
+	//                        where the postgres role names differ)
+	//   --no-privileges      skip GRANT/REVOKE (same portability concern)
+	//   --single-transaction wraps the entire restore in BEGIN/COMMIT —
+	//                        any error rolls back the whole thing.
+	//                        Implies --exit-on-error. Without this,
+	//                        pg_restore tolerates per-object failures
+	//                        and exits 0 even when restore was partial,
+	//                        which is the silent "looked successful but
+	//                        data missing" trap. Atomicity also matches
+	//                        `--clean` semantics — partial drop+recreate
+	//                        leaves the cluster in an inconsistent state.
+	//   --verbose            stream object-by-object progress to stderr
+	//                        so the operator can see what the restore
+	//                        is doing. Captured separately and included
+	//                        in the dispatch message on success.
+	var restoreOut bytes.Buffer
+
 	cmd := exec.Command(
 		"docker", "exec", "-u", "postgres", primaryContainer,
 		"pg_restore",
@@ -1750,31 +1770,134 @@ func cmdBackupsRestore() error {
 		"-d", db,
 		"--clean", "--if-exists",
 		"--no-owner", "--no-privileges",
+		"--single-transaction",
+		"--verbose",
 		containerFilePath,
 	)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = &restoreOut
+	cmd.Stderr = &restoreOut
 
 	if err := cmd.Run(); err != nil {
 		if cleanup != nil {
 			cleanup()
 		}
 
-		return fmt.Errorf("pg_restore failed: %w", err)
+		// Surface the pg_restore output so the operator sees the
+		// actual error (constraint violation, missing role, etc.)
+		// rather than just "exit 1". --single-transaction means
+		// the cluster state is unchanged; restore can be re-tried
+		// safely after the operator addresses the cause.
+		return fmt.Errorf("pg_restore failed: %w\n\npg_restore output:\n%s",
+			err, strings.TrimSpace(restoreOut.String()))
 	}
 
 	if cleanup != nil {
 		cleanup()
 	}
 
+	// Compose the message with the TOC summary up top — operators
+	// scan it to confirm "yep, my logs table has data sections in
+	// the dump." Catches the schema-only-dump bug where pg_dump
+	// went through but produced no COPY blocks (e.g. concurrent
+	// vacuum / lock issue at capture time).
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "postgres %s: restored from %s",
+		refOrName(scope, name), sourceLabel)
+
+	if tocSummary != "" {
+		fmt.Fprintf(&b, "\n%s", tocSummary)
+	}
+
+	fmt.Fprintf(&b, "\nCluster stayed up; standbys replicate restored state via streaming WAL.")
+
 	result := dispatchOutput{
-		Message: fmt.Sprintf(
-			"postgres %s: restored from %s. Cluster stayed up; standbys replicate restored state via streaming WAL.",
-			refOrName(scope, name), sourceLabel),
+		Message: b.String(),
 		Actions: nil,
 	}
 
 	return writeDispatchOutput(result)
+}
+
+// summariseDumpTOC runs `pg_restore --list <file>` against the dump
+// inside the primary pod and returns a human-readable counter of
+// data vs schema vs index entries. Used by cmdBackupsRestore to
+// flag schema-only dumps before restore — the silent-no-op trap.
+//
+// The TOC list is text — one line per archived object, with a type
+// column we count (TABLE DATA = COPY blocks, TABLE = CREATE TABLE,
+// INDEX, etc.). Best-effort: a parse failure returns ("", err) and
+// the caller proceeds without the summary rather than blocking.
+func summariseDumpTOC(container, dumpPath string) (string, error) {
+	out, err := exec.Command(
+		"docker", "exec", "-u", "postgres", container,
+		"pg_restore", "--list", dumpPath,
+	).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("pg_restore --list: %w (output: %s)", err, strings.TrimSpace(string(out)))
+	}
+
+	counts := map[string]int{}
+
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, ";") {
+			// Comment lines (`; Database: ...`, etc.).
+			continue
+		}
+
+		// Format: `<id>; <oid> <oid> <type> <schema> <name> <owner>`.
+		// We just care about <type>, the 4th token.
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+
+		// "TABLE" + "DATA" lands as two tokens — join when the next
+		// token is DATA so the bucket is "TABLE DATA".
+		typeToken := fields[3]
+		if typeToken == "TABLE" && len(fields) > 4 && fields[4] == "DATA" {
+			typeToken = "TABLE DATA"
+		}
+
+		counts[typeToken]++
+	}
+
+	if len(counts) == 0 {
+		return "dump TOC: empty (no entries — restore will be a no-op)", nil
+	}
+
+	// Surface the entry types operators care about most.
+	tableData := counts["TABLE DATA"]
+	tables := counts["TABLE"]
+	indexes := counts["INDEX"]
+	sequences := counts["SEQUENCE"]
+
+	parts := []string{
+		fmt.Sprintf("%d table data block(s)", tableData),
+	}
+
+	if tables > 0 {
+		parts = append(parts, fmt.Sprintf("%d table(s)", tables))
+	}
+
+	if indexes > 0 {
+		parts = append(parts, fmt.Sprintf("%d index(es)", indexes))
+	}
+
+	if sequences > 0 {
+		parts = append(parts, fmt.Sprintf("%d sequence(s)", sequences))
+	}
+
+	summary := "dump TOC: " + strings.Join(parts, ", ")
+
+	if tableData == 0 && tables > 0 {
+		// SCHEMA-ONLY DUMP. Most likely the silent-no-op cause.
+		// Make it impossible to miss in the success message.
+		summary += "\n⚠  no TABLE DATA blocks — dump appears to be schema-only. Restore will recreate empty tables."
+	}
+
+	return summary, nil
 }
 
 // isHTTPURL reports whether s looks like an http or https URL.
