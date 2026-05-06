@@ -978,6 +978,7 @@ const backupsCaptureHelp = `vd pg:backups:capture — take a pg_dump snapshot of
 
 USAGE
   vd pg:backups:capture <postgres-scope/name> [--from-replica <N>] [--follow]
+                                              [--keep <N>] [--max-age <duration>]
 
 ARGUMENTS
   <postgres-scope/name>   The postgres cluster.
@@ -992,6 +993,18 @@ FLAGS
                           finishes. Without --follow, capture detaches
                           immediately and returns the new ID; check
                           progress via vd pg:backups or vd pg:backups:logs.
+  --keep <N>              After capture, keep at most N backups (newest
+                          first). Older ones are deleted from disk and
+                          their containers reaped. 0 / unset = no limit.
+  --max-age <duration>    After capture, delete any backup older than
+                          the duration. Accepts 7d, 2w, 168h, etc.
+                          0 / unset = no age cap. Alias: --retention.
+
+  Retention is applied AFTER successful capture. With --follow the
+  just-completed dump counts toward the limit; in detached mode the
+  prune runs against existing files (the new one will land into the
+  freed slot). Both axes are enforced together — a backup is deleted
+  if it fails EITHER check (rank > N OR age > duration).
 
 DEFAULT: DETACHED (via voodu jobs)
   Capture emits a [apply_manifest, run_job] dispatch action pair.
@@ -1038,6 +1051,12 @@ EXAMPLES
 
   # From a standby
   vd pg:backups:capture clowk-lp/db --from-replica 1 --follow
+
+  # With retention: keep last 30 backups, drop anything older than 7d
+  vd pg:backups:capture clowk-lp/db --keep 30 --max-age 7d
+
+  # Just count cap (single-host dev/test)
+  vd pg:backups:capture clowk-lp/db --keep 10
 `
 
 // cmdBackupsCapture spawns a sibling Docker container that runs
@@ -1051,13 +1070,13 @@ func cmdBackupsCapture() error {
 		return nil
 	}
 
-	positional, fromReplica, hasFromReplica, follow, err := parseCaptureFlags(args)
+	positional, fromReplica, hasFromReplica, follow, retention, err := parseCaptureFlags(args)
 	if err != nil {
 		return err
 	}
 
 	if len(positional) < 1 {
-		return fmt.Errorf("usage: vd pg:backups:capture <postgres-scope/name> [--from-replica <N>] [--follow]")
+		return fmt.Errorf("usage: vd pg:backups:capture <postgres-scope/name> [--from-replica <N>] [--follow] [--keep <N>] [--max-age <duration>]")
 	}
 
 	scope, name := splitScopeName(positional[0])
@@ -1119,6 +1138,13 @@ func cmdBackupsCapture() error {
 	if password == "" {
 		return fmt.Errorf("no POSTGRES_PASSWORD in config bucket — has %s been applied?", refOrName(scope, name))
 	}
+
+	// Layer config-bucket retention defaults UNDER the flag-derived
+	// policy so an operator can persist BACKUP_KEEP=30 once via
+	// `vd config <ref> set` and have every subsequent capture
+	// auto-prune without typing flags. Per-axis: a flag overrides
+	// only that axis (--keep 5 ad-hoc doesn't wipe BACKUP_MAX_AGE).
+	retention = mergeRetention(retention, loadRetentionFromConfig(config))
 
 	// Auto-prune exited backup containers from prior captures so a
 	// previously-occupied bNNN slot can be re-used after the file
@@ -1224,13 +1250,38 @@ func cmdBackupsCapture() error {
 			},
 		}
 
+		// Apply retention BEFORE dispatch. The new capture is still
+		// queued at this point — pruning now frees disk for it
+		// instead of after the fact (matters on tight HDs). Existing
+		// files are the only inputs since the new dump hasn't started
+		// writing yet. Caller-controlled via --keep / --max-age; no-op
+		// when the policy is empty.
+		prunedRefs := []string{}
+		if !retention.IsZero() {
+			deleted, perr := pruneBackupsByPolicy(scope, name, retention, time.Now())
+			if perr != nil {
+				fmt.Fprintf(os.Stderr, "warn: retention prune failed: %v\n", perr)
+			}
+
+			for _, e := range deleted {
+				prunedRefs = append(prunedRefs, e.Ref())
+			}
+		}
+
 		hint := fmt.Sprintf("track: vd pg:backups %s  |  vd pg:backups:logs %s %s --follow",
 			refOrName(scope, name), refOrName(scope, name), entry.Ref())
 
+		msg := fmt.Sprintf(
+			"postgres %s: backup %s capturing in background (job %s, source: ordinal %d). %s",
+			refOrName(scope, name), entry.Ref(), refOrName(scope, jobName), source, hint)
+
+		if len(prunedRefs) > 0 {
+			msg = fmt.Sprintf("%s\nretention (%s): pruned %d backup(s): %s",
+				msg, retention, len(prunedRefs), strings.Join(prunedRefs, ", "))
+		}
+
 		result := dispatchOutput{
-			Message: fmt.Sprintf(
-				"postgres %s: backup %s capturing in background (job %s, source: ordinal %d). %s",
-				refOrName(scope, name), entry.Ref(), refOrName(scope, jobName), source, hint),
+			Message: msg,
 			Actions: actions,
 		}
 
@@ -1326,10 +1377,39 @@ func cmdBackupsCapture() error {
 
 	fmt.Fprintf(os.Stderr, "done: %s in %s\n", formatSize(size), dumpElapsed)
 
+	// Apply retention AFTER capture. Follow path waits for the
+	// new dump file to land — running prune after that lets the
+	// policy include the just-completed capture in its rank
+	// computation, so KeepLast=N really means "no more than N
+	// files exist at any time after this command returns".
+	prunedRefs := []string{}
+	if !retention.IsZero() {
+		deleted, perr := pruneBackupsByPolicy(scope, name, retention, time.Now())
+		if perr != nil {
+			fmt.Fprintf(os.Stderr, "warn: retention prune failed: %v\n", perr)
+		}
+
+		for _, e := range deleted {
+			prunedRefs = append(prunedRefs, e.Ref())
+		}
+
+		if len(prunedRefs) > 0 {
+			fmt.Fprintf(os.Stderr, "retention (%s): pruned %d backup(s): %s\n",
+				retention, len(prunedRefs), strings.Join(prunedRefs, ", "))
+		}
+	}
+
+	msg := fmt.Sprintf(
+		"postgres %s: backup %s captured (%s, %s, source: ordinal %d, elapsed %s)",
+		refOrName(scope, name), entry.Ref(), filename, formatSize(size), source, dumpElapsed)
+
+	if len(prunedRefs) > 0 {
+		msg = fmt.Sprintf("%s\nretention (%s): pruned %d backup(s): %s",
+			msg, retention, len(prunedRefs), strings.Join(prunedRefs, ", "))
+	}
+
 	result := dispatchOutput{
-		Message: fmt.Sprintf(
-			"postgres %s: backup %s captured (%s, %s, source: ordinal %d, elapsed %s)",
-			refOrName(scope, name), entry.Ref(), filename, formatSize(size), source, dumpElapsed),
+		Message: msg,
 	}
 
 	return writeDispatchOutput(result)
@@ -1364,20 +1444,33 @@ func reportCaptureProgressOnHost(hostFilePath string, estDumpBytes int64, done <
 	}
 }
 
-// parseCaptureFlags extracts --from-replica + --follow.
-func parseCaptureFlags(args []string) (positional []string, fromReplica int, hasFromReplica, follow bool, err error) {
-	for i := 0; i < len(args); i++ {
-		a := args[i]
+// parseCaptureFlags extracts --from-replica, --follow, and the
+// retention flags (--keep / --max-age / --retention). Retention
+// parsing is delegated to parseRetentionFlags so the same flag set
+// works on `:capture`, `:prune`, and the cronjob HCL emitted by
+// `:schedule`.
+func parseCaptureFlags(args []string) (positional []string, fromReplica int, hasFromReplica, follow bool, policy retentionPolicy, err error) {
+	// Retention flags first — strips them out so the remaining
+	// switch only sees the capture-specific ones.
+	residual, parsedPolicy, perr := parseRetentionFlags(args)
+	if perr != nil {
+		return nil, 0, false, false, retentionPolicy{}, perr
+	}
+
+	policy = parsedPolicy
+
+	for i := 0; i < len(residual); i++ {
+		a := residual[i]
 
 		switch {
 		case a == "--from-replica":
-			if i+1 >= len(args) {
-				return nil, 0, false, false, fmt.Errorf("--from-replica requires an integer argument")
+			if i+1 >= len(residual) {
+				return nil, 0, false, false, retentionPolicy{}, fmt.Errorf("--from-replica requires an integer argument")
 			}
 
-			n, perr := parseInt(args[i+1])
+			n, perr := parseInt(residual[i+1])
 			if perr != nil {
-				return nil, 0, false, false, fmt.Errorf("--from-replica %q: %w", args[i+1], perr)
+				return nil, 0, false, false, retentionPolicy{}, fmt.Errorf("--from-replica %q: %w", residual[i+1], perr)
 			}
 
 			fromReplica = n
@@ -1387,7 +1480,7 @@ func parseCaptureFlags(args []string) (positional []string, fromReplica int, has
 		case len(a) > 15 && a[:15] == "--from-replica=":
 			n, perr := parseInt(a[15:])
 			if perr != nil {
-				return nil, 0, false, false, fmt.Errorf("--from-replica %q: %w", a[15:], perr)
+				return nil, 0, false, false, retentionPolicy{}, fmt.Errorf("--from-replica %q: %w", a[15:], perr)
 			}
 
 			fromReplica = n
@@ -1404,7 +1497,7 @@ func parseCaptureFlags(args []string) (positional []string, fromReplica int, has
 		}
 	}
 
-	return positional, fromReplica, hasFromReplica, follow, nil
+	return positional, fromReplica, hasFromReplica, follow, policy, nil
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -2071,6 +2164,190 @@ func parseFollowFlag(args []string) (positional []string, follow bool) {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// pg:backups:prune
+// ─────────────────────────────────────────────────────────────────
+
+const backupsPruneHelp = `vd pg:backups:prune — apply retention to a cluster's backups.
+
+USAGE
+  vd pg:backups:prune <postgres-scope/name> [--keep <N>] [--max-age <duration>]
+                                            [--dry-run] [--yes]
+
+ARGUMENTS
+  <postgres-scope/name>   The postgres cluster.
+
+FLAGS
+  --keep <N>              Keep at most N most-recent backups. Older
+                          ones get deleted. 0 / unset = no count cap.
+  --max-age <duration>    Delete any backup older than the duration.
+                          Accepts 7d, 2w, 168h, etc. 0 / unset = no
+                          age cap. Alias: --retention.
+  --dry-run               Print what would be pruned, then exit
+                          without touching disk or docker.
+  --yes, -y               Skip the destructive-action confirmation.
+                          Required for non-interactive runs (cronjobs).
+
+DESTRUCTIVE
+  This deletes .dump files from disk AND removes the corresponding
+  exited backup containers. There is no undelete.
+
+WHAT IT DOES
+  1. Reads the existing backup files from /opt/voodu/backups/<scope>/<name>.
+  2. Sorts them newest-first by timestamp.
+  3. Marks for deletion: anything past rank --keep, OR older than
+     --max-age. Both gates apply — failing either one is enough to
+     delete.
+  4. Removes each .dump file and (best-effort) the matching exited
+     backup container so 'vd get pd' stays clean.
+
+EXAMPLES
+  # Drop everything except the 30 newest
+  vd pg:backups:prune clowk-lp/db --keep 30 --yes
+
+  # Drop anything older than a week, no count cap
+  vd pg:backups:prune clowk-lp/db --max-age 7d --yes
+
+  # Both: trim to 30, then drop any of those past 7d
+  vd pg:backups:prune clowk-lp/db --keep 30 --max-age 7d --yes
+
+  # Preview without touching disk
+  vd pg:backups:prune clowk-lp/db --keep 5 --dry-run
+
+NOTES
+  Auto-prune also runs after :capture when --keep / --max-age are
+  passed there. Use this command for one-shots and for the cronjob
+  you'd typically pair with :schedule.
+`
+
+// cmdBackupsPrune implements the manual retention command. Mirrors
+// the auto-prune logic that runs after a capture, but exposed as
+// its own subcommand so operators can clean up out of band (or
+// schedule a periodic prune cronjob without an attached capture).
+func cmdBackupsPrune() error {
+	args := os.Args[2:]
+
+	if hasHelpFlag(args) {
+		fmt.Print(backupsPruneHelp)
+		return nil
+	}
+
+	// Pull retention flags first; the residual carries positional
+	// args + non-retention flags.
+	residual, policy, err := parseRetentionFlags(args)
+	if err != nil {
+		return err
+	}
+
+	positional, autoYes := parseYesFlag(residual)
+
+	// Strip --dry-run after yes-parsing so it lands in residual
+	// regardless of position.
+	dryRun := false
+
+	cleaned := make([]string, 0, len(positional))
+
+	for _, a := range positional {
+		if a == "--dry-run" {
+			dryRun = true
+			continue
+		}
+
+		cleaned = append(cleaned, a)
+	}
+
+	positional = cleaned
+
+	if len(positional) < 1 {
+		return fmt.Errorf("usage: vd pg:backups:prune <postgres-scope/name> [--keep <N>] [--max-age <duration>] [--dry-run] [--yes]")
+	}
+
+	scope, name := splitScopeName(positional[0])
+	if name == "" {
+		return fmt.Errorf("invalid ref %q (expected scope/name)", positional[0])
+	}
+
+	// Layer config-bucket defaults under the flag-derived policy
+	// (same precedence as :capture). Lets the operator run `vd
+	// pg:backups:prune <ref>` with no flags and have it pick up
+	// BACKUP_KEEP / BACKUP_MAX_AGE from the bucket — fits the
+	// "set once, run forever" use case for cron-driven cleanup.
+	//
+	// Best-effort fetch: if the controller is unreachable (e.g.
+	// running locally on a node without controller_url), we keep
+	// going with just the flag-policy. Empty policy after merge
+	// is still rejected below with a helpful error.
+	ctx, ctxErr := readInvocationContext()
+	if ctxErr == nil && ctx.ControllerURL != "" {
+		client := newControllerClient(ctx.ControllerURL)
+		if config, cerr := client.fetchConfig(scope, name); cerr == nil {
+			policy = mergeRetention(policy, loadRetentionFromConfig(config))
+		}
+	}
+
+	if policy.IsZero() {
+		return fmt.Errorf("--keep or --max-age required, or set BACKUP_KEEP / BACKUP_MAX_AGE in the config bucket (nothing to prune by)")
+	}
+
+	files, err := listBackupsOnHost(scope, name)
+	if err != nil {
+		return fmt.Errorf("list backups: %w", err)
+	}
+
+	now := time.Now()
+	doomed := applyRetention(files, policy, now)
+
+	if len(doomed) == 0 {
+		fmt.Fprintf(os.Stderr, "postgres %s: nothing to prune (%d backups, policy: %s)\n",
+			refOrName(scope, name), len(files), policy)
+
+		return writeDispatchOutput(dispatchOutput{
+			Message: fmt.Sprintf("postgres %s: nothing to prune (%d backups, policy: %s)",
+				refOrName(scope, name), len(files), policy),
+		})
+	}
+
+	// Print the list before destructive execution so dry-run AND
+	// the live confirmation prompt see the same preview.
+	refs := make([]string, 0, len(doomed))
+	for _, e := range doomed {
+		refs = append(refs, e.Ref())
+	}
+
+	fmt.Fprintf(os.Stderr, "postgres %s: %d backup(s) match policy %s: %s\n",
+		refOrName(scope, name), len(doomed), policy, strings.Join(refs, ", "))
+
+	if dryRun {
+		return writeDispatchOutput(dispatchOutput{
+			Message: fmt.Sprintf("postgres %s: dry-run — would prune %d backup(s) under policy %s: %s",
+				refOrName(scope, name), len(doomed), policy, strings.Join(refs, ", ")),
+		})
+	}
+
+	if !autoYes {
+		fmt.Fprintf(os.Stderr,
+			"\n⚠  This deletes %d backup file(s) from disk + their containers. No undelete. Use --yes (or -y) to confirm.\n\n",
+			len(doomed))
+
+		return fmt.Errorf("refusing to prune without --yes")
+	}
+
+	deleted, err := pruneBackupsByPolicy(scope, name, policy, now)
+	if err != nil {
+		return err
+	}
+
+	deletedRefs := make([]string, 0, len(deleted))
+	for _, e := range deleted {
+		deletedRefs = append(deletedRefs, e.Ref())
+	}
+
+	return writeDispatchOutput(dispatchOutput{
+		Message: fmt.Sprintf("postgres %s: pruned %d backup(s) under policy %s: %s",
+			refOrName(scope, name), len(deleted), policy, strings.Join(deletedRefs, ", ")),
+	})
+}
+
+// ─────────────────────────────────────────────────────────────────
 // pg:backups:schedule
 // ─────────────────────────────────────────────────────────────────
 
@@ -2078,6 +2355,7 @@ const backupsScheduleHelp = `vd pg:backups:schedule — print a cronjob HCL bloc
 
 USAGE
   vd pg:backups:schedule <postgres-scope/name> [--at <cron-expr>] [--from-replica <N>]
+                                               [--keep <N>] [--max-age <duration>]
 
 ARGUMENTS
   <postgres-scope/name>   The postgres cluster the schedule will back up.
@@ -2091,6 +2369,11 @@ FLAGS
   --from-replica <N>      Capture from ordinal N instead of the
                           current primary. Useful to offload backup
                           load — standbys are read-only replicas.
+  --keep <N>              Cap on count. Inlined into the emitted
+                          capture command so the cronjob auto-prunes
+                          on every run.
+  --max-age <duration>    Cap on age (7d, 2w, 168h). Inlined the same
+                          way. Alias: --retention.
 
 WHAT IT DOES
   Prints an HCL cronjob block to stdout. Operator pastes it into
@@ -2109,6 +2392,9 @@ EXAMPLES
 
   # Custom cadence + offload from a standby
   vd pg:backups:schedule clowk-lp/db --at "0 */6 * * *" --from-replica 1
+
+  # Daily with retention (keep 30, drop anything > 14 days)
+  vd pg:backups:schedule clowk-lp/db --keep 30 --max-age 14d
 `
 
 // cmdBackupsSchedule prints an HCL cronjob template for the
@@ -2127,13 +2413,13 @@ func cmdBackupsSchedule() error {
 		return nil
 	}
 
-	positional, schedule, fromReplica, hasFromReplica, err := parseScheduleFlags(args)
+	positional, schedule, fromReplica, hasFromReplica, retention, err := parseScheduleFlags(args)
 	if err != nil {
 		return err
 	}
 
 	if len(positional) < 1 {
-		return fmt.Errorf("usage: vd pg:backups:schedule <postgres-scope/name> [--at <cron-expr>] [--from-replica <N>]")
+		return fmt.Errorf("usage: vd pg:backups:schedule <postgres-scope/name> [--at <cron-expr>] [--from-replica <N>] [--keep <N>] [--max-age <duration>]")
 	}
 
 	scope, name := splitScopeName(positional[0])
@@ -2148,6 +2434,17 @@ func cmdBackupsSchedule() error {
 	captureCmd := fmt.Sprintf("vd pg:backups:capture %s", refOrName(scope, name))
 	if hasFromReplica {
 		captureCmd += fmt.Sprintf(" --from-replica %d", fromReplica)
+	}
+
+	// Inline retention so the cronjob self-trims on every run. The
+	// cronjob runs in voodu-cli's environment, so the same flags
+	// the operator passed here are valid in the captured command.
+	if retention.KeepLast > 0 {
+		captureCmd += fmt.Sprintf(" --keep %d", retention.KeepLast)
+	}
+
+	if retention.MaxAge > 0 {
+		captureCmd += fmt.Sprintf(" --max-age %s", formatDurationShort(retention.MaxAge))
 	}
 
 	// Cronjob name suffix — keeps multiple postgres resources on
@@ -2170,30 +2467,35 @@ func cmdBackupsSchedule() error {
 	return nil
 }
 
-func parseScheduleFlags(args []string) (positional []string, schedule string, fromReplica int, hasFromReplica bool, err error) {
-	for i := 0; i < len(args); i++ {
-		a := args[i]
+func parseScheduleFlags(args []string) (positional []string, schedule string, fromReplica int, hasFromReplica bool, retention retentionPolicy, err error) {
+	residual, retention, perr := parseRetentionFlags(args)
+	if perr != nil {
+		return nil, "", 0, false, retentionPolicy{}, perr
+	}
+
+	for i := 0; i < len(residual); i++ {
+		a := residual[i]
 
 		switch {
 		case a == "--at":
-			if i+1 >= len(args) {
-				return nil, "", 0, false, fmt.Errorf("--at requires a cron expression")
+			if i+1 >= len(residual) {
+				return nil, "", 0, false, retentionPolicy{}, fmt.Errorf("--at requires a cron expression")
 			}
 
-			schedule = args[i+1]
+			schedule = residual[i+1]
 			i++
 
 		case len(a) > 5 && a[:5] == "--at=":
 			schedule = a[5:]
 
 		case a == "--from-replica":
-			if i+1 >= len(args) {
-				return nil, "", 0, false, fmt.Errorf("--from-replica requires an integer argument")
+			if i+1 >= len(residual) {
+				return nil, "", 0, false, retentionPolicy{}, fmt.Errorf("--from-replica requires an integer argument")
 			}
 
-			n, perr := parseInt(args[i+1])
+			n, perr := parseInt(residual[i+1])
 			if perr != nil {
-				return nil, "", 0, false, fmt.Errorf("--from-replica %q: %w", args[i+1], perr)
+				return nil, "", 0, false, retentionPolicy{}, fmt.Errorf("--from-replica %q: %w", residual[i+1], perr)
 			}
 
 			fromReplica = n
@@ -2203,7 +2505,7 @@ func parseScheduleFlags(args []string) (positional []string, schedule string, fr
 		case len(a) > 15 && a[:15] == "--from-replica=":
 			n, perr := parseInt(a[15:])
 			if perr != nil {
-				return nil, "", 0, false, fmt.Errorf("--from-replica %q: %w", a[15:], perr)
+				return nil, "", 0, false, retentionPolicy{}, fmt.Errorf("--from-replica %q: %w", a[15:], perr)
 			}
 
 			fromReplica = n
@@ -2217,7 +2519,7 @@ func parseScheduleFlags(args []string) (positional []string, schedule string, fr
 		}
 	}
 
-	return positional, schedule, fromReplica, hasFromReplica, nil
+	return positional, schedule, fromReplica, hasFromReplica, retention, nil
 }
 
 // ─────────────────────────────────────────────────────────────────

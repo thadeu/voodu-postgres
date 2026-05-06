@@ -357,7 +357,7 @@ func TestParseCaptureFlags_FromReplica(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		pos, replica, hasFlag, follow, err := parseCaptureFlags(tc.args)
+		pos, replica, hasFlag, follow, _, err := parseCaptureFlags(tc.args)
 		if err != nil {
 			t.Errorf("parseCaptureFlags(%v): unexpected err: %v", tc.args, err)
 			continue
@@ -384,7 +384,7 @@ func TestParseCaptureFlags_FromReplica(t *testing.T) {
 func TestParseCaptureFlags_MissingValue(t *testing.T) {
 	args := []string{"ref", "--from-replica"}
 
-	_, _, _, _, err := parseCaptureFlags(args)
+	_, _, _, _, _, err := parseCaptureFlags(args)
 	if err == nil {
 		t.Error("expected error for --from-replica without value")
 	}
@@ -393,7 +393,7 @@ func TestParseCaptureFlags_MissingValue(t *testing.T) {
 func TestParseCaptureFlags_InvalidInteger(t *testing.T) {
 	args := []string{"ref", "--from-replica", "abc"}
 
-	_, _, _, _, err := parseCaptureFlags(args)
+	_, _, _, _, _, err := parseCaptureFlags(args)
 	if err == nil {
 		t.Error("expected error for non-integer --from-replica")
 	}
@@ -653,7 +653,7 @@ func TestDownloadURLToTempFile_HTTPError(t *testing.T) {
 }
 
 func TestParseScheduleFlags_Defaults(t *testing.T) {
-	pos, schedule, _, hasFlag, err := parseScheduleFlags([]string{"clowk-lp/db"})
+	pos, schedule, _, hasFlag, _, err := parseScheduleFlags([]string{"clowk-lp/db"})
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -674,7 +674,7 @@ func TestParseScheduleFlags_Defaults(t *testing.T) {
 func TestParseScheduleFlags_AtAndFromReplica(t *testing.T) {
 	args := []string{"clowk-lp/db", "--at", "0 */6 * * *", "--from-replica", "1"}
 
-	_, schedule, replica, hasFlag, err := parseScheduleFlags(args)
+	_, schedule, replica, hasFlag, _, err := parseScheduleFlags(args)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -691,7 +691,7 @@ func TestParseScheduleFlags_AtAndFromReplica(t *testing.T) {
 func TestParseScheduleFlags_EqualsForms(t *testing.T) {
 	args := []string{"clowk-lp/db", "--at=0 3 * * *", "--from-replica=2"}
 
-	_, schedule, replica, hasFlag, err := parseScheduleFlags(args)
+	_, schedule, replica, hasFlag, _, err := parseScheduleFlags(args)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -706,9 +706,30 @@ func TestParseScheduleFlags_EqualsForms(t *testing.T) {
 }
 
 func TestParseScheduleFlags_AtMissingValue(t *testing.T) {
-	_, _, _, _, err := parseScheduleFlags([]string{"ref", "--at"})
+	_, _, _, _, _, err := parseScheduleFlags([]string{"ref", "--at"})
 	if err == nil {
 		t.Error("expected error for --at without value")
+	}
+}
+
+func TestParseScheduleFlags_RetentionFlags(t *testing.T) {
+	args := []string{"clowk-lp/db", "--at", "0 3 * * *", "--keep", "30", "--max-age", "7d"}
+
+	_, schedule, _, _, retention, err := parseScheduleFlags(args)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	if schedule != "0 3 * * *" {
+		t.Errorf("schedule: got %q", schedule)
+	}
+
+	if retention.KeepLast != 30 {
+		t.Errorf("KeepLast: got %d, want 30", retention.KeepLast)
+	}
+
+	if retention.MaxAge != 7*24*time.Hour {
+		t.Errorf("MaxAge: got %v, want 7d", retention.MaxAge)
 	}
 }
 

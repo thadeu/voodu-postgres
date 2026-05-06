@@ -21,6 +21,7 @@ Bare block produces a single hardened primary; `replicas = 3` flips it into a cl
   - [Rejoining the old primary](#rejoining-the-old-primary)
 - [Backup automation](#backup-automation)
   - [`vd pg:backups` (Heroku-style)](#vd-pgbackups-heroku-style-recommended)
+  - [Retention (`--keep` / `--max-age`)](#retention---keep----max-age)
   - [`vd postgres:backup` / `vd postgres:restore` (legacy)](#vd-postgresbackup--vd-postgresrestore-legacy-pg_basebackup)
 - [Connecting via `psql`](#connecting-via-psql)
 - [Real-world examples](#real-world-examples)
@@ -586,6 +587,122 @@ Runs `docker stop` on the matching `<scope>-<name>-backup-bNNN` containers. The 
 
 The container's wrapper script removes the partial dump file on non-zero exit, so a cancelled capture leaves no garbage in `/backups/`.
 
+#### Retention (`--keep` / `--max-age`)
+
+Backups grow unboundedly without intervention — every `:capture` writes a new `.dump` and leaves the exited job container behind. On a tight host (e.g. dev/test on a single 80GB HD) you want both:
+
+- a **count cap** so the most recent N captures stay around regardless of cadence, and
+- an **age cap** so really old snapshots get reaped even if you've barely been capturing.
+
+Two CLI flags cover both axes; the plugin auto-prunes after each capture and on demand via `:prune`. Both flags accept the same shapes everywhere they appear.
+
+**Flags:**
+
+| Flag | Meaning | Examples |
+|---|---|---|
+| `--keep <N>` | Keep at most N most-recent backups | `--keep 30` |
+| `--max-age <D>` | Drop anything older than D | `--max-age 7d`, `--max-age 2w`, `--max-age 168h` |
+| `--retention <D>` | Alias for `--max-age` | same as above |
+
+A backup is deleted if it fails **either** check (rank > N **or** age > D). Both flags are optional — pass none = no auto-prune.
+
+**Persisted defaults via the config bucket:**
+
+The plugin seeds `BACKUP_KEEP=30` on first apply. Subsequent `:capture` invocations pick this up automatically — no flags needed:
+
+```bash
+# First apply seeds BACKUP_KEEP=30 in the bucket
+vd apply
+
+# This single command captures + auto-prunes to 30 newest
+vd pg:backups:capture clowk-lp/db
+# postgres clowk-lp/db: backup b031 captured ...
+# retention (keep 30): pruned 1 backup(s): b001
+```
+
+Override the persisted policy any time:
+
+```bash
+# Lower cap for a specific cluster
+vd config clowk-lp/db set BACKUP_KEEP=14
+
+# Add age cap on top
+vd config clowk-lp/db set BACKUP_MAX_AGE=14d
+
+# Disable auto-prune entirely (capture stops touching old files)
+vd config clowk-lp/db set BACKUP_KEEP=0
+vd config clowk-lp/db set BACKUP_MAX_AGE=
+```
+
+Precedence per axis:
+
+1. **CLI flag** (`--keep`, `--max-age`) — wins for that axis only
+2. **App-level bucket** (`vd config <scope>/<name> set ...`) — per-resource
+3. **Scope-level bucket** (`vd config <scope> set ...`) — shared default for every resource in the scope
+4. **Built-in default** — empty (no auto-prune); plugin seeds `BACKUP_KEEP=30` only at first apply, app-level
+
+Per-axis means `--keep 5` for a one-off doesn't blow away the bucket's `BACKUP_MAX_AGE=14d` — only the count axis gets overridden for that invocation.
+
+**Shared defaults via scope-level config:**
+
+The controller's `ResolveConfig` merges **scope-level + app-level** (app wins on conflict) and the plugin reads through this — no `env_from` plumbing needed. Set the policy once for an entire scope:
+
+```bash
+# All postgres resources in scope `clowk-lp` inherit these
+vd config clowk-lp set BACKUP_KEEP=14
+vd config clowk-lp set BACKUP_MAX_AGE=7d
+
+# Override one specific cluster
+vd config clowk-lp/db set BACKUP_KEEP=30
+```
+
+> **Why not `env_from`:** the plugin reads policy via `GET /config` (controller's bucket store) BEFORE the capture container is spawned. `env_from` is a runtime container-env injection mechanism — different code path. Use scope-level config for shared defaults.
+
+**On-demand prune (`:prune`):**
+
+```bash
+# Preview without touching disk — uses bucket defaults if no flags
+vd pg:backups:prune clowk-lp/db --dry-run
+
+# Tighter one-off
+vd pg:backups:prune clowk-lp/db --keep 5 --yes
+
+# Both axes, explicit
+vd pg:backups:prune clowk-lp/db --keep 14 --max-age 7d --yes
+```
+
+`:prune` reads the bucket the same way as `:capture`. With `BACKUP_KEEP=30` already set, `vd pg:backups:prune clowk-lp/db --yes` is enough — no flags needed.
+
+`--yes` is required for destructive runs; `--dry-run` skips the confirmation gate AND the disk operations, useful for cron previewing.
+
+**What gets pruned:**
+
+For each backup that fails the policy:
+
+1. The `.dump` file in `/opt/voodu/backups/<scope>/<name>/` is removed.
+2. The matching exited backup container (from `docker ps -a`) is `docker rm`'d so `vd get pd` stays clean.
+
+Running containers are always skipped — never reap an in-flight capture.
+
+**Schedule with retention inlined:**
+
+`:schedule` accepts the same flags and inlines them into the cronjob's command, so the cron-driven captures self-trim:
+
+```bash
+vd pg:backups:schedule clowk-lp/db --at "0 3 * * *" --keep 30 --max-age 14d
+```
+
+```hcl
+cronjob "clowk-lp" "db-backup" {
+  schedule = "0 3 * * *"
+  image    = "ghcr.io/clowk/voodu-cli:latest"
+
+  command = ["bash", "-c", "vd pg:backups:capture clowk-lp/db --keep 30 --max-age 14d"]
+}
+```
+
+You can also rely on the bucket-persisted defaults and skip the flags here — the cronjob will pick up `BACKUP_KEEP` / `BACKUP_MAX_AGE` from the config bucket the same way an interactive `:capture` does.
+
 #### Off-site durability
 
 ```hcl
@@ -770,12 +887,13 @@ vd postgres:unexpose clowk-lp/db
 | `vd postgres:rejoin <postgres> --replica <N>` | Re-attach a divergent pod as standby via `pg_rewind` |
 | `vd postgres:psql <postgres> [--replica N] [-c "<sql>"]` | Drop into psql against the cluster (no password needed) |
 | `vd pg:backups <postgres> [-o json]` | List backups + status (running/complete/failed) |
-| `vd pg:backups:capture <postgres> [--from-replica N] [--follow]` | Spawn pg_dump in a sibling container (detached default) |
+| `vd pg:backups:capture <postgres> [--from-replica N] [--follow] [--keep N] [--max-age D]` | Spawn pg_dump in a sibling container (detached default); auto-prunes after success when retention flags or `BACKUP_KEEP`/`BACKUP_MAX_AGE` set |
 | `vd pg:backups:logs <postgres> <id> [--follow]` | docker logs on a backup container |
 | `vd pg:backups:restore <postgres> <id\|url> --yes` | `pg_restore` from local id or http(s) URL (DESTRUCTIVE of db content) |
 | `vd pg:backups:download <postgres> <id> [--to <path>]` | Copy a backup file from the pod to the host |
 | `vd pg:backups:delete <postgres> <id> --yes` | Remove a backup file from `/backups/` |
-| `vd pg:backups:schedule <postgres> [--at <cron>] [--from-replica N]` | Print cronjob HCL template for paste-and-apply |
+| `vd pg:backups:prune <postgres> [--keep N] [--max-age D] [--dry-run] [--yes]` | Apply retention on demand (file + container cleanup) |
+| `vd pg:backups:schedule <postgres> [--at <cron>] [--from-replica N] [--keep N] [--max-age D]` | Print cronjob HCL template for paste-and-apply (retention inlined into the captured command) |
 | `vd pg:backups:cancel <postgres> [<id>]` | docker stop running capture(s) |
 | `vd postgres:backup <postgres> --destination <path> [--from-replica N]` | (legacy) `pg_basebackup` snapshot to a tar file |
 | `vd postgres:restore <postgres> --from <path> --yes` | (legacy) Restore PGDATA from a tar (DESTRUCTIVE of cluster) |
@@ -818,8 +936,14 @@ The `voodu-NN-` prefixes order the include_dir scan: plugin defaults (50) load b
 | `POSTGRES_LINKED_CONSUMERS` | `vd postgres:link/unlink` | Comma-separated `<scope>/<name>` refs for `new-password`/`failover` fan-out |
 | `PG_EXPOSE_PUBLIC` | `vd postgres:expose/unexpose` | `"true"` flips ports to 0.0.0.0; absent = loopback |
 | `PG_PRIMARY_ORDINAL` | `vd postgres:failover` | Current primary ordinal (default `0`); flipped by failover, read by wrapper script + streaming.conf renderer |
+| `BACKUP_KEEP` | seeded by plugin (default `30`); operator-tunable | Cap on backup count for auto-prune. `0` / empty disables count-based pruning. Read by `:capture` and `:prune`. |
+| `BACKUP_MAX_AGE` | operator | Cap on backup age for auto-prune. Accepts `7d`, `2w`, `168h`. Empty disables age-based pruning. Read by `:capture` and `:prune`. |
 
 Operator can read all of these via `vd config <ref>`. Setting them manually before first apply pre-seeds (useful for dev environments wanting deterministic passwords).
+
+**Scope-level inheritance:** any of these keys can be set at the scope level (`vd config <scope> set KEY=VAL` — no `/<name>`) and the plugin will pick them up. App-level (`vd config <scope>/<name> set ...`) wins on conflict. Useful for shared defaults like `BACKUP_KEEP`/`BACKUP_MAX_AGE` across every postgres in a scope without touching each resource bucket.
+
+**`env_from` does NOT apply to plugin reads.** `env_from` injects vars into the container's runtime environment; plugins read through the controller's `GET /config` (etcd store). For shared defaults, use scope-level config above.
 
 ### Repo layout
 

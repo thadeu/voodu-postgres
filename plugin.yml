@@ -1,6 +1,6 @@
 name: postgres
 aliases: [pg]
-version: 0.10.8
+version: 0.11.0
 description: >
   Voodu plugin for postgres clusters. Single primary + N standbys
   via streaming replication, WAL archive (local default,
@@ -116,12 +116,21 @@ commands:
       (returns the new ID immediately); --follow streams logs +
       progress. Detached path emits apply_manifest + run_job
       dispatch actions; --follow stays docker-direct.
-      Usage: vd pg:backups:capture <postgres-scope/name> [--from-replica N] [--follow]
+      Auto-prune AFTER capture when --keep N or --max-age D set.
+      Usage: vd pg:backups:capture <postgres-scope/name> [--from-replica N] [--follow] [--keep N] [--max-age D]
 
   - name: backups:logs
     help: >
       docker logs on a backup container.
       Usage: vd pg:backups:logs <postgres-scope/name> <backup-id> [--follow]
+
+  - name: backups:prune
+    help: >
+      Apply retention to a cluster's backups: delete .dump files +
+      reap the matching exited containers. --keep N caps count,
+      --max-age D caps age (7d, 2w, 168h). DESTRUCTIVE; --yes
+      required (use --dry-run to preview).
+      Usage: vd pg:backups:prune <postgres-scope/name> [--keep N] [--max-age D] [--dry-run] [--yes]
 
   - name: backups:restore
     help: >

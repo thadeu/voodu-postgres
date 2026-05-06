@@ -173,7 +173,7 @@ type expandedPayload struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		emitErr("usage: voodu-postgres <expand|link|unlink|new-password|info|expose|unexpose|promote|rejoin|psql|backup|restore|backups|backups:capture|backups:restore|backups:download|backups:delete|backups:schedule|backups:cancel|backups:logs|defaults|help|--version>")
+		emitErr("usage: voodu-postgres <expand|link|unlink|new-password|info|expose|unexpose|promote|rejoin|psql|backup|restore|backups|backups:capture|backups:restore|backups:download|backups:delete|backups:schedule|backups:cancel|backups:logs|backups:prune|defaults|help|--version>")
 		os.Exit(1)
 	}
 
@@ -325,6 +325,16 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "backups:prune":
+		// `vd pg:backups:prune <ref> [--keep N] [--max-age D]` —
+		// retention policy applied on demand. Same semantics as
+		// the auto-prune that runs after a successful capture, but
+		// triggerable independently (cleanup, schedule cronjobs).
+		if err := cmdBackupsPrune(); err != nil {
+			emitErr(err.Error())
+			os.Exit(1)
+		}
+
 	case "help":
 		// `vd postgres -h` reaches us as a "help" subcommand.
 		// Plain text on stdout (no envelope) — operator sees the
@@ -332,7 +342,7 @@ func main() {
 		printPluginOverview()
 
 	default:
-		emitErr(fmt.Sprintf("unknown subcommand %q (want expand|link|unlink|new-password|info|expose|unexpose|promote|rejoin|psql|backup|restore|backups|backups:capture|backups:restore|backups:download|backups:delete|backups:schedule|backups:cancel|backups:logs|defaults|help)", os.Args[1]))
+		emitErr(fmt.Sprintf("unknown subcommand %q (want expand|link|unlink|new-password|info|expose|unexpose|promote|rejoin|psql|backup|restore|backups|backups:capture|backups:restore|backups:download|backups:delete|backups:schedule|backups:cancel|backups:logs|backups:prune|defaults|help)", os.Args[1]))
 		os.Exit(1)
 	}
 }
@@ -465,6 +475,24 @@ func cmdExpand() error {
 			Scope: req.Scope,
 			Name:  req.Name,
 			KV:    map[string]string{replicationPasswordKey: replicationPassword},
+		})
+	}
+
+	// Seed the backup retention default on first apply only —
+	// subsequent applies leave the operator's `vd config set
+	// BACKUP_KEEP=…` (or the deliberate "0 = disable" choice)
+	// alone. The explicit isNew gate is the same pattern used
+	// for the auto-gen passwords above.
+	//
+	// We only seed BACKUP_KEEP. BACKUP_MAX_AGE stays empty so
+	// operators discover it through the README/help and opt in
+	// when they want a time cap on top of the count cap.
+	if isNew && req.Config[backupKeepKey] == "" {
+		out.Actions = append(out.Actions, dispatchAction{
+			Type:  "config_set",
+			Scope: req.Scope,
+			Name:  req.Name,
+			KV:    map[string]string{backupKeepKey: defaultBackupKeep},
 		})
 	}
 
