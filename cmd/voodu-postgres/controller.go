@@ -217,3 +217,45 @@ func (c *controllerClient) fetchConfig(scope, name string) (map[string]string, e
 
 	return env.Data.Vars, nil
 }
+
+// restartStatefulset triggers a rolling restart of every pod in
+// the named statefulset via `POST /restart?kind=statefulset&...`.
+//
+// Used by rejoin's rebootstrap fallback: after the plugin wipes
+// pod-N's container + volume, the reconciler needs a nudge to
+// re-Ensure the missing pod immediately. Without this RPC, the
+// pod recreates only on the next periodic reconcile (could be
+// minutes). The endpoint also rolls every other pod, which is
+// fine — they restart cleanly with their existing PGDATA, the
+// only freshly-bootstrapped one is the target.
+func (c *controllerClient) restartStatefulset(scope, name string) error {
+	if c.baseURL == "" {
+		return fmt.Errorf("no controller_url available")
+	}
+
+	u := fmt.Sprintf("%s/restart?kind=statefulset&scope=%s&name=%s",
+		c.baseURL,
+		url.QueryEscape(scope),
+		url.QueryEscape(name),
+	)
+
+	req, err := http.NewRequest(http.MethodPost, u, nil)
+	if err != nil {
+		return fmt.Errorf("build restart request: %w", err)
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("restart RPC: %w", err)
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("restart %s/%s: HTTP %d: %s",
+			scope, name, resp.StatusCode, body)
+	}
+
+	return nil
+}

@@ -59,6 +59,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 )
 
 const rejoinHelp = `vd postgres:rejoin — re-attach a divergent pod as standby of the current primary.
@@ -85,24 +86,29 @@ PRE-FLIGHT
     the bucket) must be valid on the current primary.
 
 WHEN pg_rewind FAILS
-  pg_rewind needs the diverging WAL on the source primary. If the
-  divergence is too large (WAL recycled past the divergence point),
-  it exits with "could not find previous WAL record at...". Recovery
-  fallback:
+  pg_rewind needs the diverging WAL on the source primary. When the
+  divergence is too large (WAL recycled past the divergence point)
+  or the target's PGDATA is from a previous session that pg_rewind
+  can't reconcile, the command FALLS BACK AUTOMATICALLY to a clean
+  rebootstrap:
 
-    vd delete <postgres-scope/name> --replica <N> --prune
-    vd apply -f voodu.hcl
+    1. Force-removes the target container.
+    2. Wipes the target's data volume (voodu-<scope>-<name>-data-<N>).
+    3. Triggers a controller restart so the reconciler recreates the
+       pod immediately.
+    4. The wrapper's first-boot path runs pg_basebackup from the
+       primary; the standby comes up streaming WAL.
 
-  That wipes the pod's data volume; the wrapper's first-boot path
-  bootstraps a fresh copy via pg_basebackup.
+  Why the auto-fallback is safe: a standby is by definition a clone
+  of the primary. Wiping + re-cloning produces an identical state —
+  no data is lost that wasn't already on the primary. Slow on big
+  DBs (basebackup reads the cluster over the network) but always
+  predictable; no operator follow-up required.
 
 EXAMPLES
-  # Standard post-failover recovery (old primary was pod-0)
+  # Standard post-failover recovery (old primary was pod-0).
+  # If pg_rewind succeeds, fast path. If not, auto-rebootstrap.
   vd postgres:rejoin clowk-lp/db --replica 0
-
-  # If pg_rewind fails, fallback:
-  vd delete clowk-lp/db --replica 0 --prune
-  vd apply -f voodu.hcl
 
 NOTES
   - pg_rewind silently drops writes the old primary had that didn't
@@ -210,12 +216,34 @@ func cmdRejoin() error {
 	fmt.Fprintf(os.Stderr, "rejoin: running pg_rewind --target=%s --source=host=%s port=%d user=%s\n",
 		pgdataPath, primaryFQDN, port, replUser)
 
-	if err := dockerRunPgRewind(containerName, image, pgdataPath, primaryFQDN, port, replUser, replPassword); err != nil {
-		// pg_rewind failed. Container stays stopped; operator
-		// inspects + decides whether to retry, fallback to
-		// wipe-and-basebackup, or restore from a dump.
-		return fmt.Errorf("pg_rewind on %s: %w (container left stopped — inspect + retry, or wipe with `vd delete --replica %d --prune` then re-apply for fresh basebackup)",
-			containerName, err, target)
+	rewindErr := dockerRunPgRewind(containerName, image, pgdataPath, primaryFQDN, port, replUser, replPassword)
+	if rewindErr != nil {
+		// pg_rewind failed. Auto-fall back to a clean rebootstrap:
+		// wipe the data volume and let the wrapper run a fresh
+		// pg_basebackup from the primary. For a STANDBY this is
+		// always safe — by definition every byte was sourced from
+		// the primary anyway, so re-cloning produces an
+		// identical-to-primary state. The pg_rewind path stays as
+		// the fast happy-path (small divergence preserves data
+		// across the rewind), but operators should never get
+		// stuck because of pg_rewind's strict prerequisites.
+		fmt.Fprintf(os.Stderr,
+			"rejoin: pg_rewind failed (%v) — falling back to wipe + pg_basebackup rebootstrap\n",
+			rewindErr)
+
+		if err := rebootstrapStandby(scope, name, target, containerName); err != nil {
+			return fmt.Errorf("pg_rewind failed AND fallback rebootstrap failed: rewind=%v; rebootstrap=%w (manual recovery: `docker rm -f %s && docker volume rm %s && vd apply`)",
+				rewindErr, err, containerName, composeStandbyVolumeName(scope, name, target))
+		}
+
+		out := dispatchOutput{
+			Message: fmt.Sprintf(
+				"postgres %s: rejoined ordinal %d as standby (pg_rewind failed; rebootstrapped via pg_basebackup from pod-%d). The pod is starting; check `vd logs %s` to confirm streaming resumed.",
+				refOrName(scope, name), target, primaryOrdinal, refOrName(scope, name)),
+			Actions: nil,
+		}
+
+		return writeDispatchOutput(out)
 	}
 
 	fmt.Fprintf(os.Stderr, "rejoin: arming standby.signal in %s\n", pgdataPath)
@@ -234,12 +262,106 @@ func cmdRejoin() error {
 
 	out := dispatchOutput{
 		Message: fmt.Sprintf(
-			"postgres %s: rejoined ordinal %d as standby of pod-%d. The pod is starting; check `vd logs %s` to confirm streaming resumed.",
+			"postgres %s: rejoined ordinal %d as standby of pod-%d (pg_rewind preserved local data). The pod is starting; check `vd logs %s` to confirm streaming resumed.",
 			refOrName(scope, name), target, primaryOrdinal, refOrName(scope, name)),
 		Actions: nil,
 	}
 
 	return writeDispatchOutput(out)
+}
+
+// composeStandbyVolumeName mirrors the controller's volumeName()
+// (`voodu-<scope>-<name>-<claim>-<ordinal>`). Postgres uses claim
+// name "data" — set verbatim by composeStatefulsetDefaults — so we
+// hard-code it here. Unscoped postgres elides the scope segment to
+// match the controller's convention.
+func composeStandbyVolumeName(scope, name string, ordinal int) string {
+	base := name
+	if scope != "" {
+		base = scope + "-" + name
+	}
+
+	return fmt.Sprintf("voodu-%s-data-%d", base, ordinal)
+}
+
+// rebootstrapStandby is the reliable-recovery fallback: force-remove
+// the standby's container, wipe its data volume, and let the
+// reconciler recreate it. The wrapper's first-boot path then runs
+// pg_basebackup from the primary so the fresh standby comes up
+// streaming WAL automatically.
+//
+// Why this is safe: a standby's data is by definition a clone of
+// the primary. Wiping it and re-cloning preserves no information
+// the primary doesn't already have. Slow on big DBs (basebackup
+// reads the whole cluster over the network), but predictable —
+// no operator manual steps, no obscure pg_rewind prerequisites,
+// no half-applied state.
+//
+// Triggers reconcile via `controller_url + /restart` so the
+// reconciler immediately re-Ensures the missing container with a
+// fresh empty volume. Without an explicit trigger, the operator
+// would have to wait for the next periodic reconcile.
+func rebootstrapStandby(scope, name string, ordinal int, containerName string) error {
+	volName := composeStandbyVolumeName(scope, name, ordinal)
+
+	fmt.Fprintf(os.Stderr, "rebootstrap: docker rm -f %s\n", containerName)
+
+	if out, err := exec.Command("docker", "rm", "-f", containerName).CombinedOutput(); err != nil {
+		// Tolerate already-gone — `docker rm -f` returns non-zero
+		// only on real failures (daemon unreachable, permission
+		// denied), not on "no such container".
+		msg := strings.ToLower(strings.TrimSpace(string(out)))
+		if !strings.Contains(msg, "no such container") {
+			return fmt.Errorf("docker rm -f %s: %w (%s)",
+				containerName, err, strings.TrimSpace(string(out)))
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "rebootstrap: docker volume rm %s\n", volName)
+
+	if out, err := exec.Command("docker", "volume", "rm", volName).CombinedOutput(); err != nil {
+		msg := strings.ToLower(strings.TrimSpace(string(out)))
+		if !strings.Contains(msg, "no such volume") {
+			return fmt.Errorf("docker volume rm %s: %w (%s)",
+				volName, err, strings.TrimSpace(string(out)))
+		}
+	}
+
+	// Trigger reconcile so the reconciler recreates the missing
+	// pod immediately. The controller's /restart endpoint nudges
+	// the watch loop without requiring a full apply round-trip.
+	ctx, err := readInvocationContext()
+	if err != nil {
+		// Without controller_url we can't trigger reconcile, but
+		// the volume + container are already gone — next periodic
+		// reconcile will catch up. Surface a soft warning.
+		fmt.Fprintf(os.Stderr,
+			"rebootstrap: warn — no controller_url; reconciler will recreate pod-%d on its next pass\n",
+			ordinal)
+
+		return nil
+	}
+
+	if ctx.ControllerURL == "" {
+		fmt.Fprintf(os.Stderr,
+			"rebootstrap: warn — empty controller_url; reconciler will recreate pod-%d on its next pass\n",
+			ordinal)
+
+		return nil
+	}
+
+	client := newControllerClient(ctx.ControllerURL)
+
+	if err := client.restartStatefulset(scope, name); err != nil {
+		// Best-effort — the volume/container are already gone, so
+		// the next reconcile (apply / etcd watch tick) recovers.
+		// Don't fail the whole rebootstrap on a flaky restart RPC.
+		fmt.Fprintf(os.Stderr,
+			"rebootstrap: warn — restart RPC failed (%v); pod-%d will recover on next reconcile\n",
+			err, ordinal)
+	}
+
+	return nil
 }
 
 // parseRejoinFlags pulls --replica <N> from args.

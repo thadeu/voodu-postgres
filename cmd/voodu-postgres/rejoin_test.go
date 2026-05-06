@@ -115,20 +115,53 @@ func TestReadPortInt(t *testing.T) {
 	}
 }
 
-func TestRejoinHelpMentionsRecoveryFallback(t *testing.T) {
-	// pg_rewind can fail when divergence is too large. Help text
-	// must point at the wipe-and-basebackup fallback so operators
-	// aren't stuck staring at "could not find previous WAL record".
+// TestRejoinHelpMentionsAutoFallback pins the new auto-fallback
+// guarantee: when pg_rewind fails, rejoin doesn't bail to the
+// operator — it wipes the volume and re-clones via pg_basebackup
+// automatically. The help text must explain that mechanism so
+// operators understand what's about to happen (and don't think
+// the failure is fatal).
+func TestRejoinHelpMentionsAutoFallback(t *testing.T) {
 	wantPhrases := []string{
 		"pg_rewind",
-		"vd delete",
-		"--prune",
+		"FALLS BACK AUTOMATICALLY",
 		"pg_basebackup",
+		// Clarity that it's safe — standby is a clone, no data loss.
+		"a clone",
+		"no data is lost",
 	}
 
 	for _, want := range wantPhrases {
 		if !strings.Contains(rejoinHelp, want) {
-			t.Errorf("rejoinHelp missing %q: recovery fallback must be discoverable", want)
+			t.Errorf("rejoinHelp missing %q: auto-fallback must be discoverable", want)
+		}
+	}
+}
+
+// TestComposeStandbyVolumeName mirrors the controller's
+// volumeName() so the plugin's wipe path actually targets the
+// volume the controller created. Drift between the two breaks
+// the auto-rebootstrap silently — `docker volume rm` succeeds on
+// "no such volume", leaving the real one intact and the next pod
+// boot reusing stale data.
+func TestComposeStandbyVolumeName(t *testing.T) {
+	cases := []struct {
+		scope, name string
+		ord         int
+		want        string
+	}{
+		{"clowk-lp", "db", 0, "voodu-clowk-lp-db-data-0"},
+		{"clowk-lp", "db", 1, "voodu-clowk-lp-db-data-1"},
+		{"data", "main", 7, "voodu-data-main-data-7"},
+		// Unscoped — no leading scope segment.
+		{"", "pg", 2, "voodu-pg-data-2"},
+	}
+
+	for _, tc := range cases {
+		got := composeStandbyVolumeName(tc.scope, tc.name, tc.ord)
+		if got != tc.want {
+			t.Errorf("composeStandbyVolumeName(%q,%q,%d): got %q, want %q",
+				tc.scope, tc.name, tc.ord, got, tc.want)
 		}
 	}
 }
