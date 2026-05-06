@@ -1231,6 +1231,12 @@ func cmdBackupsCapture() error {
 			"failed_history_limit":     3,
 		}
 
+		// Friendly action labels — the controller's `applied`
+		// checklist shows these instead of the verbose
+		// `apply_manifest <kind>/<scope>/<name>` defaults. Operators
+		// scanning `vd pg:backups:capture` output don't care which
+		// dispatch primitive is which; they want a quick "yes, the
+		// backup got queued."
 		actions := []dispatchAction{
 			{
 				Type:  "apply_manifest",
@@ -1242,11 +1248,13 @@ func cmdBackupsCapture() error {
 					Name:  jobName,
 					Spec:  jobSpec,
 				},
+				Summary: fmt.Sprintf("job manifest applied: %s", refOrName(scope, jobName)),
 			},
 			{
-				Type:  "run_job",
-				Scope: scope,
-				Name:  jobName,
+				Type:    "run_job",
+				Scope:   scope,
+				Name:    jobName,
+				Summary: fmt.Sprintf("backup %s dispatched", entry.Ref()),
 			},
 		}
 
@@ -1268,20 +1276,33 @@ func cmdBackupsCapture() error {
 			}
 		}
 
-		hint := fmt.Sprintf("track: vd pg:backups %s  |  vd pg:backups:logs %s %s --follow",
-			refOrName(scope, name), refOrName(scope, name), entry.Ref())
+		// Compose a multi-line message that reads top-down:
+		//
+		//   1. Headline — what's happening, where, from which source
+		//   2. Side effects — retention if any
+		//   3. Track block — copy-paste-able commands the operator
+		//      uses to follow the running capture
+		//
+		// The controller appends the ✓ checklist below this; that
+		// gives operators (a) the human summary first, (b) the
+		// programmatic confirmations second. Reading order matches
+		// what they'd ask: "what happened?" → "what should I run
+		// next?" → "did it apply?".
+		var b strings.Builder
 
-		msg := fmt.Sprintf(
-			"postgres %s: backup %s capturing in background (job %s, source: ordinal %d). %s",
-			refOrName(scope, name), entry.Ref(), refOrName(scope, jobName), source, hint)
+		fmt.Fprintf(&b, "postgres %s: capturing backup %s in background (source: %s)",
+			refOrName(scope, name), entry.Ref(), formatSourceLabel(source, primaryOrdinal))
 
 		if len(prunedRefs) > 0 {
-			msg = fmt.Sprintf("%s\nretention (%s): pruned %d backup(s): %s",
-				msg, retention, len(prunedRefs), strings.Join(prunedRefs, ", "))
+			fmt.Fprintf(&b, "\nretention: %s, pruned %s",
+				retention, strings.Join(prunedRefs, ", "))
 		}
 
+		fmt.Fprintf(&b, "\n\nTrack:\n  vd pg:backups %s\n  vd pg:backups:logs %s %s --follow",
+			refOrName(scope, name), refOrName(scope, name), entry.Ref())
+
 		result := dispatchOutput{
-			Message: msg,
+			Message: b.String(),
 			Actions: actions,
 		}
 
@@ -1399,20 +1420,41 @@ func cmdBackupsCapture() error {
 		}
 	}
 
-	msg := fmt.Sprintf(
-		"postgres %s: backup %s captured (%s, %s, source: ordinal %d, elapsed %s)",
-		refOrName(scope, name), entry.Ref(), filename, formatSize(size), source, dumpElapsed)
+	// Compose the success message in the same multi-line shape as
+	// the detached path so operators see consistent output between
+	// `--follow` and detached captures. Summary fields aren't used
+	// here (no actions to label — the work already happened
+	// foreground), so all the side effects ride the message body.
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "postgres %s: backup %s captured (%s, %s, source: %s, elapsed %s)",
+		refOrName(scope, name), entry.Ref(), filename, formatSize(size),
+		formatSourceLabel(source, primaryOrdinal), dumpElapsed)
 
 	if len(prunedRefs) > 0 {
-		msg = fmt.Sprintf("%s\nretention (%s): pruned %d backup(s): %s",
-			msg, retention, len(prunedRefs), strings.Join(prunedRefs, ", "))
+		fmt.Fprintf(&b, "\nretention: %s, pruned %s",
+			retention, strings.Join(prunedRefs, ", "))
 	}
 
 	result := dispatchOutput{
-		Message: msg,
+		Message: b.String(),
 	}
 
 	return writeDispatchOutput(result)
+}
+
+// formatSourceLabel renders the dump source as "primary" or
+// "replica N" instead of the raw ordinal. Operators read it as
+// role, not coordinate — the ordinal number doesn't say anything
+// about whether they're hammering the writer or offloading to a
+// standby. The plain "ordinal N" form was a debug crutch leaking
+// into operator-facing output.
+func formatSourceLabel(source, primaryOrdinal int) string {
+	if source == primaryOrdinal {
+		return "primary"
+	}
+
+	return fmt.Sprintf("replica %d", source)
 }
 
 // reportCaptureProgressOnHost is the host-side variant of the
