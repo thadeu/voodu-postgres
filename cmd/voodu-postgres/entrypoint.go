@@ -294,16 +294,26 @@ EOF
 else
     log "role=PRIMARY (ordinal=$ORDINAL)"
 
-    # On the rare path where this pod was previously a STANDBY
-    # (post-promote: pg_promote() removed standby.signal but the
-    # runtime conf still has primary_conninfo from when this pod
-    # was a follower), drop the file. primary_conninfo without
-    # standby.signal is harmless but visually confusing in
-    # describe / pg_settings output.
+    # On PRIMARY we write a stub runtime conf (just a header
+    # comment, NO primary_conninfo) so the include_if_exists in
+    # postgresql.conf doesn't emit "skipping missing configuration
+    # file" LOG on every startup. Also overwrites any stale
+    # primary_conninfo from a previous STANDBY run (post-promote).
+    #
+    # Gated on PG_VERSION because on the very first boot of a
+    # fresh primary, PGDATA is empty and the official entrypoint's
+    # initdb will run AFTER this wrapper hands off — initdb
+    # requires the directory empty, so writing into it first
+    # would break the bootstrap. The "missing config file" LOG
+    # appears once on that first boot then never again.
     runtime_conf="$PGDATA/voodu-runtime.conf"
-    if [ -f "$runtime_conf" ]; then
-        rm -f "$runtime_conf"
-        log "removed stale $runtime_conf (this pod is now PRIMARY)"
+
+    if [ -f "$PGDATA/PG_VERSION" ]; then
+        cat > "$runtime_conf" <<'EOF'
+# voodu-postgres runtime conf — this pod is PRIMARY, no primary_conninfo
+# needed. The file exists only to silence the postgres "skipping missing
+# configuration file" LOG that include_if_exists emits otherwise.
+EOF
     fi
 fi
 
