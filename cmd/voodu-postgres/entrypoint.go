@@ -213,20 +213,51 @@ if [ "$ORDINAL" != "$PRIMARY_ORDINAL" ]; then
         # Refuse to start. Operator runs vd postgres:rejoin to
         # pg_rewind this pod against the current primary and arm
         # standby.signal, then a normal restart resumes streaming.
+        # Compose the volume name the way voodu's statefulset
+        # reconciler does: voodu-<scope>-<name>-data-<ordinal>.
+        # Bash inside the container can't see env from the host
+        # but PG_NAME / PG_SCOPE_SUFFIX / ORDINAL are all set; the
+        # scope segment is reconstructed from PG_SCOPE_SUFFIX
+        # (".scope.voodu" → "scope") to give the operator an
+        # exact copy-pasteable command.
+        SCOPE_SEG="${PG_SCOPE_SUFFIX#.}"
+        SCOPE_SEG="${SCOPE_SEG%.voodu}"
+
+        if [ -n "$SCOPE_SEG" ]; then
+            CONTAINER_NAME="${SCOPE_SEG}-${PG_NAME}.${ORDINAL}"
+            VOLUME_NAME="voodu-${SCOPE_SEG}-${PG_NAME}-data-${ORDINAL}"
+            REJOIN_REF="${SCOPE_SEG}/${PG_NAME}"
+        else
+            CONTAINER_NAME="${PG_NAME}.${ORDINAL}"
+            VOLUME_NAME="voodu-${PG_NAME}-data-${ORDINAL}"
+            REJOIN_REF="${PG_NAME}"
+        fi
+
         log "ERROR: pod ordinal=$ORDINAL is configured as STANDBY (primary=$PRIMARY_ORDINAL),"
         log "       but PGDATA was last used as primary (no standby.signal found)."
         log "       This usually means a failover happened and this pod must be"
-        log "       reattached to the new primary."
+        log "       reattached to the new primary — OR the previous run left a"
+        log "       stale volume after 'vd delete' (which preserves data)."
         log ""
-        log "       Recovery:"
-        log "         vd postgres:rejoin <postgres-scope/name> --replica $ORDINAL"
+        log "       Recovery (try in order):"
         log ""
-        log "       That command runs pg_rewind against the current primary, arms"
-        log "       standby.signal, and restarts this pod to resume streaming."
+        log "       1) Try pg_rewind against the current primary (preserves data"
+        log "          divergence is small):"
         log ""
-        log "       If pg_rewind fails (data divergence too large), the fallback"
-        log "       is to wipe this pod's data volume and re-apply — the wrapper"
-        log "       will then bootstrap a fresh standby via pg_basebackup."
+        log "             vd postgres:rejoin $REJOIN_REF --replica $ORDINAL"
+        log ""
+        log "       2) If pg_rewind fails (data divergence too large, or volume"
+        log "          is from a previous session), wipe this pod's data volume."
+        log "          The reconciler will recreate the pod and the wrapper will"
+        log "          bootstrap a fresh standby via pg_basebackup:"
+        log ""
+        log "             docker rm -f $CONTAINER_NAME"
+        log "             docker volume rm $VOLUME_NAME"
+        log "             vd apply"
+        log ""
+        log "       3) For clean teardowns next time, use 'vd delete --prune'"
+        log "          which removes data volumes too (default 'vd delete'"
+        log "          preserves them for accidental-deletion safety)."
         exit 1
     else
         log "PGDATA already populated + standby.signal present — resuming as standby (subsequent boot)"
