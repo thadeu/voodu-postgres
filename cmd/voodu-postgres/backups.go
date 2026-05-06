@@ -1806,11 +1806,21 @@ FLAGS
                           working directory.
 
 WHAT IT DOES
-  docker cp <primary>:/backups/<filename> <host-path>
+  Resolves the file path on the controller host (the same
+  /opt/voodu/backups/<scope>/<name>/<filename> the capture writes via
+  the host bind-mount) and emits a fetch_file dispatch action. The
+  operator-side CLI then transfers it:
 
-  Bytes are copied verbatim — pg_dump custom format file, restorable
-  via pg_restore on any postgres ≥ source major version. Works fine
-  to ship a backup to another voodu host or to a local laptop.
+    - SSH auto-forward in play   → scp from controller to operator
+    - running on the controller  → cp local
+
+  scp shows native byte-rate progress and has no size limit, so this
+  works for multi-GB dumps the same as for a 906-byte test dump. SSH
+  credentials reuse the same pair the auto-forward already trusts.
+
+  Output is the verbatim pg_dump custom format, restorable via
+  pg_restore on any postgres ≥ source major version. Works fine to
+  ship a backup to another voodu host or to a local laptop.
 
 EXAMPLES
   vd pg:backups:download clowk-lp/db b007
@@ -1820,9 +1830,19 @@ EXAMPLES
   # → /srv/archive/db.dump
 `
 
-// cmdBackupsDownload copies a backup file from the primary pod to a
-// host path. Useful for off-host shipping (laptop, S3 sync via host
-// awscli, etc.).
+// cmdBackupsDownload looks up the backup file on the controller
+// host's bind-mount and emits a fetch_file dispatch action telling
+// the operator-side CLI where to find it. The CLI handles the
+// actual transfer — scp when auto-forwarded over SSH (with native
+// progress + no size limit), cp when running locally on the
+// controller. The plugin itself never reads bytes.
+//
+// Why metadata-only: with auto-forward (Mac CLI → SSH → VM
+// controller), a server-side `docker cp` writes to the VM, not
+// the operator's machine. Earlier we tried base64-in-envelope
+// streaming, but that capped at ~256 MiB and burned 3x RAM.
+// Delegating to scp gives unlimited size + native progress and
+// reuses the SSH credentials the auto-forward already has.
 func cmdBackupsDownload() error {
 	args := os.Args[2:]
 
@@ -1844,41 +1864,13 @@ func cmdBackupsDownload() error {
 
 	id := positional[1]
 
-	ctx, err := readInvocationContext()
+	// Read the backup catalog from the HOST bind-mount, not the
+	// pod. listBackupsOnHost works whether or not a pod is
+	// running — operators sometimes need to download backups
+	// during teardown (the pod is gone but the volume remains).
+	entries, err := listBackupsOnHost(scope, name)
 	if err != nil {
-		return err
-	}
-
-	if ctx.ControllerURL == "" {
-		return fmt.Errorf("download requires controller_url (needs primary ordinal from config bucket)")
-	}
-
-	client := newControllerClient(ctx.ControllerURL)
-
-	config, err := client.fetchConfig(scope, name)
-	if err != nil {
-		return fmt.Errorf("config get %s: %w", refOrName(scope, name), err)
-	}
-
-	primaryOrdinal := readCurrentPrimaryOrdinal(config)
-	primaryContainer := containerNameFor(scope, name, primaryOrdinal)
-
-	if !containerExists(primaryContainer) {
-		return fmt.Errorf("container %s not found on this host", primaryContainer)
-	}
-
-	running, err := containerIsRunning(primaryContainer)
-	if err != nil {
-		return fmt.Errorf("inspect %s: %w", primaryContainer, err)
-	}
-
-	if !running {
-		return fmt.Errorf("container %s is not running (need a live pod to copy from)", primaryContainer)
-	}
-
-	entries, err := listBackupsInPod(primaryContainer)
-	if err != nil {
-		return err
+		return fmt.Errorf("list backups: %w", err)
 	}
 
 	entry, err := resolveBackupByID(entries, id)
@@ -1890,23 +1882,26 @@ func cmdBackupsDownload() error {
 		dest = entry.Filename
 	}
 
-	srcPath := backupsContainerPath + "/" + entry.Filename
+	hostPath := composeBackupHostPath(scope, name) + "/" + entry.Filename
 
-	fmt.Fprintf(os.Stderr, "download: docker cp %s:%s → %s (%s)\n",
-		primaryContainer, srcPath, dest, formatSize(entry.SizeBytes))
-
-	cmd := exec.Command("docker", "cp", primaryContainer+":"+srcPath, dest)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("docker cp failed: %w", err)
+	info, err := os.Stat(hostPath)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", hostPath, err)
 	}
 
 	result := dispatchOutput{
-		Message: fmt.Sprintf("postgres %s: backup %s copied to %s (%s)",
-			refOrName(scope, name), entry.Ref(), dest, formatSize(entry.SizeBytes)),
-		Actions: nil,
+		Message: fmt.Sprintf("postgres %s: backup %s located (%s)",
+			refOrName(scope, name), entry.Ref(), formatSize(info.Size())),
+		Actions: []dispatchAction{
+			{
+				Type:       "fetch_file",
+				Scope:      scope,
+				Name:       name,
+				RemotePath: hostPath,
+				DestPath:   dest,
+				SizeBytes:  info.Size(),
+			},
+		},
 	}
 
 	return writeDispatchOutput(result)

@@ -139,6 +139,25 @@ type dispatchAction struct {
 	// needs the operator's terminal. Controller passes this
 	// through verbatim; it does not execute server-side.
 	Command []string `json:"command,omitempty"`
+
+	// fetch_file payload — instructs the operator-side CLI to
+	// transfer the file at RemotePath (on the controller host)
+	// to DestPath (on the operator's filesystem). The CLI picks
+	// scp (when running auto-forwarded over SSH) or cp (when
+	// running directly on the controller host) — plugins emit
+	// the same shape regardless.
+	//
+	// Why metadata-only and not bytes-in-envelope: streaming via
+	// scp reuses the SSH credentials the auto-forward already
+	// has, gets native progress for free, and isn't bound by RAM
+	// or JSON-envelope size budgets. Bytes-in-dispatch was a dead
+	// end above ~few hundred MiB and lacked progress.
+	//
+	// Controller passes this through verbatim (same model as
+	// exec_local) — it never reads or copies the file itself.
+	RemotePath string `json:"remote_path,omitempty"`
+	DestPath   string `json:"dest_path,omitempty"`
+	SizeBytes  int64  `json:"size_bytes,omitempty"`
 }
 
 // dispatchManifest is the wire shape for apply_manifest payloads.
