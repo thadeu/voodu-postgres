@@ -555,7 +555,11 @@ func buildLinkURLsWithPrimary(scope, name string, spec map[string]any, config ma
 		hosts = append(hosts, fmt.Sprintf("%s:%d", standbyFQDN, port))
 	}
 
-	out.ReadURL = composePostgresURL(user, password, joinComma(hosts), 0, db, "target_session_attrs=any")
+	// `load_balance_hosts=random` paired with `target_session_attrs=any`
+	// — see buildLinkURLs for the rationale. Mirrored here so the
+	// post-promote URL refresh on consumers carries the same load-
+	// distribution semantics as the original link-time URL.
+	out.ReadURL = composePostgresURL(user, password, joinComma(hosts), 0, db, "target_session_attrs=any&load_balance_hosts=random")
 
 	return out, nil
 }

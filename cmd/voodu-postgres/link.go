@@ -74,7 +74,8 @@ ARGUMENTS
 FLAGS
   --reads                 Also emit DATABASE_READ_URL spanning
                           standbys (libpq multi-host with
-                          target_session_attrs=any). Requires the
+                          target_session_attrs=any &
+                          load_balance_hosts=random). Requires the
                           provider to have replicas > 1; on a single
                           replica DATABASE_READ_URL echoes the primary.
 
@@ -82,8 +83,28 @@ EMITS (CONSUMER)
   DATABASE_URL            postgres://user:pw@db-0.scope.voodu:5432/db
                           → primary (write endpoint, ordinal 0)
   DATABASE_READ_URL       postgres://user:pw@db-1.scope.voodu:5432,
-                          db-2.scope.voodu:5432/db?target_session_attrs=any
+                          db-2.scope.voodu:5432/db
+                          ?target_session_attrs=any
+                          &load_balance_hosts=random
                           → multi-host pool of standbys (only with --reads)
+
+LOAD BALANCING ACROSS STANDBYS
+  load_balance_hosts=random is a libpq 16+ client param that makes
+  every new connection pick a random host from the list, so reads
+  actually share the load across replicas. Older libpq clients
+  silently ignore the param and fall back to ordered failover
+  (always hit the first host, fail over to next on connection
+  refused). Postgres SERVER version doesn't matter — only the
+  client's libpq does. Rails / Django / Go pgx / etc. on a recent
+  base image (postgres:16, alpine:3.20+) get the random pick for
+  free.
+
+  Without load_balance_hosts, multi-host URLs read like a fail-
+  over list, not a load-balance pool — every connection hits db-1
+  first, db-2 only if db-1 dies. Operators commonly mistake this
+  for a docker-DNS-round-robin issue (it isn't — docker DNS
+  doesn't round-robin aliases either; the libpq param is the
+  fix).
 
 EMITS (PROVIDER, internal)
   POSTGRES_LINKED_CONSUMERS  comma-separated consumer refs, used by
@@ -347,17 +368,29 @@ func buildLinkURLs(scope, name string, spec map[string]any, config map[string]st
 	}
 
 	// Multi-host libpq URL spanning every standby (ordinals
-	// 1..replicas-1, primary at 0 excluded). target_session_attrs=any
-	// lets libpq accept whichever host responds first; clients
-	// who want strict standby-only can use prefer-standby (postgres
-	// 14+) by overriding via env var.
+	// 1..replicas-1, primary at 0 excluded).
+	//
+	//   target_session_attrs=any  — libpq accepts whichever host
+	//                               responds (vs prefer-standby
+	//                               which is libpq-14+ but stricter)
+	//
+	//   load_balance_hosts=random — libpq 16+ randomises the host
+	//                               pick on each connection, so
+	//                               three standbys actually share
+	//                               the read load instead of every
+	//                               connection landing on the first.
+	//                               Older libpq versions silently
+	//                               ignore the unknown param, so
+	//                               this is safe to ship by default
+	//                               (old clients keep the existing
+	//                               ordered-failover behaviour).
 	hosts := make([]string, 0, replicas-1)
 	for i := 1; i < replicas; i++ {
 		standbyFQDN := composePrimaryFQDN(scope, name, i)
 		hosts = append(hosts, fmt.Sprintf("%s:%d", standbyFQDN, port))
 	}
 
-	out.ReadURL = composePostgresURL(user, password, strings.Join(hosts, ","), 0, db, "target_session_attrs=any")
+	out.ReadURL = composePostgresURL(user, password, strings.Join(hosts, ","), 0, db, "target_session_attrs=any&load_balance_hosts=random")
 
 	return out, nil
 }

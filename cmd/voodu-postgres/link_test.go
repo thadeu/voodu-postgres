@@ -115,6 +115,18 @@ func TestBuildLinkURLs_MultiReplicaWithReadsMultiHost(t *testing.T) {
 	if !strings.Contains(urls.ReadURL, "target_session_attrs=any") {
 		t.Errorf("ReadURL should include target_session_attrs=any: %q", urls.ReadURL)
 	}
+
+	// load_balance_hosts=random is a libpq 16+ param that randomises
+	// host pick per connection. Without it, every consumer
+	// connection lands on the first listed standby (ordered
+	// failover, not load balancing). Older libpq clients silently
+	// ignore the param so it's safe to ship by default. Pin it so
+	// a future refactor doesn't accidentally drop the parameter
+	// and put operators back into the "all reads hit db-1"
+	// surprise.
+	if !strings.Contains(urls.ReadURL, "load_balance_hosts=random") {
+		t.Errorf("ReadURL should include load_balance_hosts=random for libpq 16+ load balancing: %q", urls.ReadURL)
+	}
 }
 
 func TestBuildLinkURLs_PasswordURLEncoded(t *testing.T) {
