@@ -363,7 +363,13 @@ func cmdPromote() error {
 				err)
 		}
 
-		autoRejoinErr = runRejoin(scope, name, current)
+		// Use runRejoinCore (not runRejoin) so the inner step
+		// returns its result struct without emitting a separate
+		// dispatch envelope. cmdPromote folds the rejoin summary
+		// into ITS envelope below — operator sees one JSON
+		// payload, not two interleaved on stdout.
+		rejoinRes, err := runRejoinCore(scope, name, current)
+		autoRejoinErr = err
 		if autoRejoinErr != nil {
 			// Old primary failed to rejoin. The promote ITSELF
 			// succeeded (new primary is live, bucket flipped, URLs
@@ -377,8 +383,15 @@ func cmdPromote() error {
 			msg = fmt.Sprintf("%s\n⚠  Auto-rejoin of OLD primary (ordinal %d) FAILED: %v\n   Run manually: vd pg:rejoin %s --replica %d",
 				msg, current, autoRejoinErr, refOrName(scope, name), current)
 		} else {
-			msg = fmt.Sprintf("%s\nOLD primary (ordinal %d) auto-rejoined as standby.",
-				msg, current)
+			suffix := ""
+			if rejoinRes.Rebootstrapped {
+				suffix = " (rebootstrapped via pg_basebackup — slower path; pg_rewind couldn't reconcile the divergence)"
+			} else {
+				suffix = " (pg_rewind preserved local data)"
+			}
+
+			msg = fmt.Sprintf("%s\nOLD primary (ordinal %d) auto-rejoined as standby%s.",
+				msg, current, suffix)
 		}
 	} else {
 		// --no-restart: keep the breadcrumb so the operator knows

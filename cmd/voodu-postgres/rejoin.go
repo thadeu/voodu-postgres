@@ -59,7 +59,6 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
-	"strings"
 )
 
 const rejoinHelp = `vd postgres:rejoin — re-attach a divergent pod as standby of the current primary.
@@ -160,55 +159,94 @@ func cmdRejoin() error {
 	return runRejoin(scope, name, target)
 }
 
-// runRejoin is the core rejoin orchestration callable from any
-// command that needs to reattach a divergent pod as standby.
-// cmdRejoin parses argv and delegates here; cmdPromote chains it
-// in directly so the failover flow ends with a single command —
-// no separate rejoin step on the OLD primary.
-//
-// Owns the full lifecycle: spec/config fetch, validation, container
-// stop, pg_rewind attempt, auto-fallback to rebootstrap on rewind
-// failure, standby.signal arming, container restart. Writes the
-// dispatch envelope at the end so the operator sees the same
-// success message regardless of which entry point invoked it.
+// rejoinResult is what runRejoinCore returns: a human-readable
+// summary describing what happened (pg_rewind preserved data /
+// rebootstrap re-cloned via basebackup) so callers compose their
+// own dispatch envelope. cmdRejoin uses it to write a single
+// envelope; cmdPromote folds the summary into its outer envelope
+// so the operator sees one JSON envelope, not two.
+type rejoinResult struct {
+	// Message is the operator-facing one-liner ("rejoined ordinal
+	// 0 as standby of pod-1; pg_rewind preserved local data" or
+	// "...; rebootstrapped via pg_basebackup").
+	Message string
+
+	// Rebootstrapped is true when the auto-fallback wipe-and-clone
+	// path ran. Callers can mention it in their own message so
+	// operators know the slower basebackup path was taken (matters
+	// on big DBs where it might take minutes).
+	Rebootstrapped bool
+}
+
+// runRejoin is the convenience wrapper that emits a dispatch
+// envelope after calling runRejoinCore. Used by cmdRejoin (the
+// direct-invocation path); cmdPromote calls runRejoinCore
+// directly so it can fold the message into its own envelope
+// instead of emitting two.
 func runRejoin(scope, name string, target int) error {
-	ctx, err := readInvocationContext()
+	res, err := runRejoinCore(scope, name, target)
 	if err != nil {
 		return err
 	}
 
+	return writeDispatchOutput(dispatchOutput{
+		Message: res.Message,
+		Actions: nil,
+	})
+}
+
+// runRejoinCore is the core rejoin orchestration callable from any
+// command that needs to reattach a divergent pod as standby.
+// cmdRejoin parses argv → calls runRejoin (envelope-emitting wrapper);
+// cmdPromote chains it in directly via runRejoinCore so the failover
+// flow ends with a single command — no separate rejoin step on the
+// OLD primary, and no double JSON envelope on stdout.
+//
+// Owns the full lifecycle: spec/config fetch, validation, container
+// stop, pg_rewind attempt, auto-fallback to rebootstrap on rewind
+// failure, standby.signal arming, container restart. Returns the
+// result as a struct so callers can compose their own dispatch
+// envelope around it.
+func runRejoinCore(scope, name string, target int) (rejoinResult, error) {
+	zero := rejoinResult{}
+
+	ctx, err := readInvocationContext()
+	if err != nil {
+		return zero, err
+	}
+
 	if ctx.ControllerURL == "" {
-		return fmt.Errorf("rejoin requires controller_url (no offline mode — needs primary ordinal + replication password from controller)")
+		return zero, fmt.Errorf("rejoin requires controller_url (no offline mode — needs primary ordinal + replication password from controller)")
 	}
 
 	client := newControllerClient(ctx.ControllerURL)
 
 	spec, err := client.fetchSpec("statefulset", scope, name)
 	if err != nil {
-		return fmt.Errorf("describe %s: %w", refOrName(scope, name), err)
+		return zero, fmt.Errorf("describe %s: %w", refOrName(scope, name), err)
 	}
 
 	config, err := client.fetchConfig(scope, name)
 	if err != nil {
-		return fmt.Errorf("config get %s: %w", refOrName(scope, name), err)
+		return zero, fmt.Errorf("config get %s: %w", refOrName(scope, name), err)
 	}
 
 	replicas := readReplicas(spec)
 
 	if target < 0 || target >= replicas {
-		return fmt.Errorf("--replica %d out of range (valid: 0..%d)", target, replicas-1)
+		return zero, fmt.Errorf("--replica %d out of range (valid: 0..%d)", target, replicas-1)
 	}
 
 	primaryOrdinal := readCurrentPrimaryOrdinal(config)
 
 	if target == primaryOrdinal {
-		return fmt.Errorf("postgres %s: cannot rejoin ordinal %d — it IS the current primary",
+		return zero, fmt.Errorf("postgres %s: cannot rejoin ordinal %d — it IS the current primary",
 			refOrName(scope, name), target)
 	}
 
 	replPassword := config[replicationPasswordKey]
 	if replPassword == "" {
-		return fmt.Errorf("postgres %s: %s missing from bucket — has the cluster ever booted? cmdExpand auto-gens it on first apply",
+		return zero, fmt.Errorf("postgres %s: %s missing from bucket — has the cluster ever booted? cmdExpand auto-gens it on first apply",
 			refOrName(scope, name), replicationPasswordKey)
 	}
 
@@ -217,7 +255,7 @@ func runRejoin(scope, name string, target int) error {
 	containerName := containerNameFor(scope, name, target)
 
 	if !containerExists(containerName) {
-		return fmt.Errorf("container %s not found on this host (rejoin must run on the same host as the target pod)", containerName)
+		return zero, fmt.Errorf("container %s not found on this host (rejoin must run on the same host as the target pod)", containerName)
 	}
 
 	primaryFQDN := composePrimaryFQDN(scope, name, primaryOrdinal)
@@ -240,7 +278,7 @@ func runRejoin(scope, name string, target int) error {
 	fmt.Fprintf(os.Stderr, "rejoin: stopping container %s\n", containerName)
 
 	if err := dockerStop(containerName); err != nil {
-		return fmt.Errorf("stop %s: %w", containerName, err)
+		return zero, fmt.Errorf("stop %s: %w", containerName, err)
 	}
 
 	fmt.Fprintf(os.Stderr, "rejoin: running pg_rewind --target=%s --source=host=%s port=%d user=%s\n",
@@ -262,42 +300,38 @@ func runRejoin(scope, name string, target int) error {
 			rewindErr)
 
 		if err := rebootstrapStandby(scope, name, target, containerName); err != nil {
-			return fmt.Errorf("pg_rewind failed AND fallback rebootstrap failed: rewind=%v; rebootstrap=%w (manual recovery: `docker rm -f %s && docker volume rm %s && vd apply`)",
+			return zero, fmt.Errorf("pg_rewind failed AND fallback rebootstrap failed: rewind=%v; rebootstrap=%w (manual recovery: `docker rm -f %s && docker volume rm %s && vd apply`)",
 				rewindErr, err, containerName, composeStandbyVolumeName(scope, name, target))
 		}
 
-		out := dispatchOutput{
+		return rejoinResult{
 			Message: fmt.Sprintf(
 				"postgres %s: rejoined ordinal %d as standby (pg_rewind failed; rebootstrapped via pg_basebackup from pod-%d). The pod is starting; check `vd logs %s` to confirm streaming resumed.",
 				refOrName(scope, name), target, primaryOrdinal, refOrName(scope, name)),
-			Actions: nil,
-		}
-
-		return writeDispatchOutput(out)
+			Rebootstrapped: true,
+		}, nil
 	}
 
 	fmt.Fprintf(os.Stderr, "rejoin: arming standby.signal in %s\n", pgdataPath)
 
 	if err := dockerRunTouchStandbySignal(containerName, image, pgdataPath); err != nil {
-		return fmt.Errorf("touch standby.signal on %s: %w (container stopped — operator must arm signal manually + start)",
+		return zero, fmt.Errorf("touch standby.signal on %s: %w (container stopped — operator must arm signal manually + start)",
 			containerName, err)
 	}
 
 	fmt.Fprintf(os.Stderr, "rejoin: starting container %s\n", containerName)
 
 	if err := dockerStart(containerName); err != nil {
-		return fmt.Errorf("start %s: %w (rejoin succeeded but container failed to start — check `docker logs %s`)",
+		return zero, fmt.Errorf("start %s: %w (rejoin succeeded but container failed to start — check `docker logs %s`)",
 			containerName, err, containerName)
 	}
 
-	out := dispatchOutput{
+	return rejoinResult{
 		Message: fmt.Sprintf(
 			"postgres %s: rejoined ordinal %d as standby of pod-%d (pg_rewind preserved local data). The pod is starting; check `vd logs %s` to confirm streaming resumed.",
 			refOrName(scope, name), target, primaryOrdinal, refOrName(scope, name)),
-		Actions: nil,
-	}
-
-	return writeDispatchOutput(out)
+		Rebootstrapped: false,
+	}, nil
 }
 
 // composeStandbyVolumeName mirrors the controller's volumeName()
@@ -314,11 +348,11 @@ func composeStandbyVolumeName(scope, name string, ordinal int) string {
 	return fmt.Sprintf("voodu-%s-data-%d", base, ordinal)
 }
 
-// rebootstrapStandby is the reliable-recovery fallback: force-remove
-// the standby's container, wipe its data volume, and let the
-// reconciler recreate it. The wrapper's first-boot path then runs
-// pg_basebackup from the primary so the fresh standby comes up
-// streaming WAL automatically.
+// rebootstrapStandby is the reliable-recovery fallback: ask the
+// controller to wipe the standby's container + volume and re-Ensure
+// only that ordinal. The wrapper's first-boot path runs pg_basebackup
+// from the primary so the fresh standby comes up streaming WAL
+// automatically.
 //
 // Why this is safe: a standby's data is by definition a clone of
 // the primary. Wiping it and re-cloning preserves no information
@@ -327,68 +361,31 @@ func composeStandbyVolumeName(scope, name string, ordinal int) string {
 // no operator manual steps, no obscure pg_rewind prerequisites,
 // no half-applied state.
 //
-// Triggers reconcile via `controller_url + /restart` so the
-// reconciler immediately re-Ensures the missing container with a
-// fresh empty volume. Without an explicit trigger, the operator
-// would have to wait for the next periodic reconcile.
+// Delegates to the controller's per-pod delete endpoint
+// (`DELETE /resource?ordinal=N&prune=true`) which is the lightweight
+// path: it stops + removes JUST the target pod's container, wipes
+// the matching volume, and synthesises a watch event that re-Ensures
+// the missing ordinal. The earlier implementation called the
+// statefulset-wide /restart endpoint which rolled EVERY pod —
+// including the new primary — putting the cluster in flux for
+// minutes after a failover. The targeted endpoint touches only the
+// pod we're actually rebootstrapping.
 func rebootstrapStandby(scope, name string, ordinal int, containerName string) error {
-	volName := composeStandbyVolumeName(scope, name, ordinal)
-
-	fmt.Fprintf(os.Stderr, "rebootstrap: docker rm -f %s\n", containerName)
-
-	if out, err := exec.Command("docker", "rm", "-f", containerName).CombinedOutput(); err != nil {
-		// Tolerate already-gone — `docker rm -f` returns non-zero
-		// only on real failures (daemon unreachable, permission
-		// denied), not on "no such container".
-		msg := strings.ToLower(strings.TrimSpace(string(out)))
-		if !strings.Contains(msg, "no such container") {
-			return fmt.Errorf("docker rm -f %s: %w (%s)",
-				containerName, err, strings.TrimSpace(string(out)))
-		}
-	}
-
-	fmt.Fprintf(os.Stderr, "rebootstrap: docker volume rm %s\n", volName)
-
-	if out, err := exec.Command("docker", "volume", "rm", volName).CombinedOutput(); err != nil {
-		msg := strings.ToLower(strings.TrimSpace(string(out)))
-		if !strings.Contains(msg, "no such volume") {
-			return fmt.Errorf("docker volume rm %s: %w (%s)",
-				volName, err, strings.TrimSpace(string(out)))
-		}
-	}
-
-	// Trigger reconcile so the reconciler recreates the missing
-	// pod immediately. The controller's /restart endpoint nudges
-	// the watch loop without requiring a full apply round-trip.
 	ctx, err := readInvocationContext()
 	if err != nil {
-		// Without controller_url we can't trigger reconcile, but
-		// the volume + container are already gone — next periodic
-		// reconcile will catch up. Surface a soft warning.
-		fmt.Fprintf(os.Stderr,
-			"rebootstrap: warn — no controller_url; reconciler will recreate pod-%d on its next pass\n",
-			ordinal)
-
-		return nil
+		return fmt.Errorf("rebootstrap requires controller_url: %w", err)
 	}
 
 	if ctx.ControllerURL == "" {
-		fmt.Fprintf(os.Stderr,
-			"rebootstrap: warn — empty controller_url; reconciler will recreate pod-%d on its next pass\n",
-			ordinal)
-
-		return nil
+		return fmt.Errorf("rebootstrap requires controller_url (no offline mode — needs the per-pod delete endpoint)")
 	}
 
 	client := newControllerClient(ctx.ControllerURL)
 
-	if err := client.restartStatefulset(scope, name); err != nil {
-		// Best-effort — the volume/container are already gone, so
-		// the next reconcile (apply / etcd watch tick) recovers.
-		// Don't fail the whole rebootstrap on a flaky restart RPC.
-		fmt.Fprintf(os.Stderr,
-			"rebootstrap: warn — restart RPC failed (%v); pod-%d will recover on next reconcile\n",
-			err, ordinal)
+	fmt.Fprintf(os.Stderr, "rebootstrap: requesting controller to wipe + recreate ordinal %d\n", ordinal)
+
+	if err := client.deletePod(scope, name, ordinal, true); err != nil {
+		return fmt.Errorf("controller per-pod delete failed: %w", err)
 	}
 
 	return nil

@@ -257,6 +257,55 @@ func (c *controllerClient) fetchConfig(scope, name string) (map[string]string, e
 	return env.Data.Vars, nil
 }
 
+// deletePod hits the controller's per-pod delete endpoint
+// (`DELETE /resource?scope=&name=&ordinal=N&prune=...`). The
+// server stops + removes just the target pod's container,
+// optionally wipes its data volume, and re-Ensures the missing
+// ordinal so the pod recreates from spec.
+//
+// Used by rejoin's auto-fallback rebootstrap. Strictly lighter
+// than `/restart`: only the one pod is touched, the rest of the
+// cluster keeps serving. With prune=true the volume is wiped so
+// the wrapper's first-boot path runs pg_basebackup; with
+// prune=false the existing data is reused (rare for rejoin —
+// usually we want the fresh clone).
+func (c *controllerClient) deletePod(scope, name string, ordinal int, prune bool) error {
+	if c.baseURL == "" {
+		return fmt.Errorf("no controller_url available")
+	}
+
+	q := url.Values{}
+	q.Set("scope", scope)
+	q.Set("name", name)
+	q.Set("ordinal", fmt.Sprintf("%d", ordinal))
+
+	if prune {
+		q.Set("prune", "true")
+	}
+
+	u := fmt.Sprintf("%s/resource?%s", c.baseURL, q.Encode())
+
+	req, err := http.NewRequest(http.MethodDelete, u, nil)
+	if err != nil {
+		return fmt.Errorf("build delete request: %w", err)
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("delete pod RPC: %w", err)
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("delete pod %s/%s.%d: HTTP %d: %s",
+			scope, name, ordinal, resp.StatusCode, body)
+	}
+
+	return nil
+}
+
 // patchConfig writes one or more config bucket keys via the
 // controller's `POST /config?scope=&name=` endpoint. Used by
 // promote's auto-rejoin to flush PG_PRIMARY_ORDINAL synchronously
