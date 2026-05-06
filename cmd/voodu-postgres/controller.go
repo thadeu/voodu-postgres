@@ -307,12 +307,18 @@ func (c *controllerClient) deletePod(scope, name string, ordinal int, prune bool
 }
 
 // patchConfig writes one or more config bucket keys via the
-// controller's `POST /config?scope=&name=` endpoint. Used by
-// promote's auto-rejoin to flush PG_PRIMARY_ORDINAL synchronously
-// before invoking runRejoin (which reads the same key); the
-// dispatch envelope emits the config_set action again at the end
-// for audit, harmless because config_set is idempotent.
-func (c *controllerClient) patchConfig(scope, name string, kv map[string]string) error {
+// controller's `POST /config?scope=&name=` endpoint. Pass
+// skipRestart=true to suppress the controller's restart fan-out
+// — critical when the caller is about to do its own targeted
+// teardown (auto-rejoin's rebootstrap) and a parallel rolling
+// restart would race and kill pods mid-flight.
+//
+// Used by promote's auto-rejoin: flushPrimaryOrdinal needs the
+// new PG_PRIMARY_ORDINAL visible to subsequent fetchConfig calls
+// (so runRejoinCore reads the post-promote ordinal) WITHOUT
+// kicking off a rolling restart that would interfere with the
+// rebootstrap of the old primary's container/volume.
+func (c *controllerClient) patchConfig(scope, name string, kv map[string]string, skipRestart bool) error {
 	if c.baseURL == "" {
 		return fmt.Errorf("no controller_url available")
 	}
@@ -322,11 +328,15 @@ func (c *controllerClient) patchConfig(scope, name string, kv map[string]string)
 		return fmt.Errorf("encode kv: %w", err)
 	}
 
-	u := fmt.Sprintf("%s/config?scope=%s&name=%s",
-		c.baseURL,
-		url.QueryEscape(scope),
-		url.QueryEscape(name),
-	)
+	q := url.Values{}
+	q.Set("scope", scope)
+	q.Set("name", name)
+
+	if skipRestart {
+		q.Set("restart", "false")
+	}
+
+	u := fmt.Sprintf("%s/config?%s", c.baseURL, q.Encode())
 
 	req, err := http.NewRequest(http.MethodPost, u, strings.NewReader(string(body)))
 	if err != nil {

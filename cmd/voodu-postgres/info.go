@@ -140,7 +140,22 @@ type infoSnapshot struct {
 func composeInfoSnapshot(scope, name string, spec map[string]any, config map[string]string) infoSnapshot {
 	user, db, port := readUserDBPort(spec)
 	replicas := readReplicas(spec)
-	primaryOrdinal := readPrimaryOrdinal(spec)
+
+	// Bucket wins over spec.env for PG_PRIMARY_ORDINAL — the
+	// runtime env file regen merges the same way (bucket override),
+	// so info should reflect what the running pods will see on
+	// their next start. Reading spec.env alone shows the value
+	// baked at last `vd apply` time, which is stale immediately
+	// after `vd postgres:promote` flips the bucket but doesn't
+	// re-expand. The bucket fallback chain:
+	//   1. config[PG_PRIMARY_ORDINAL] (current truth, post-promote)
+	//   2. spec.env[PG_PRIMARY_ORDINAL] (last apply's value)
+	//   3. 0 (default — fresh cluster, pod-0 is primary)
+	primaryOrdinal := readCurrentPrimaryOrdinal(config)
+	if _, ok := config[primaryOrdinalKey]; !ok {
+		primaryOrdinal = readPrimaryOrdinal(spec)
+	}
+
 	exposed := config["PG_EXPOSE_PUBLIC"] == "true"
 
 	bindAddr := "127.0.0.1 (loopback only — use vd postgres:expose to publish)"

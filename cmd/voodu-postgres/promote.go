@@ -260,15 +260,31 @@ func cmdPromote() error {
 	newConfig[primaryOrdinalKey] = strconv.Itoa(target)
 
 	// Action 1: flip the primary ordinal on the postgres bucket.
-	// SkipRestart honoured per --no-restart; default false →
-	// triggers the rolling restart that re-renders streaming.conf
-	// with the new primary FQDN on every pod.
+	// ALWAYS SkipRestart=true — the auto-rejoin below already
+	// rebootstraps the OLD primary (and pod-1 was promoted in
+	// place, no restart needed). Without skip, the controller's
+	// rolling restart fires AFTER cmdPromote returns and races
+	// the auto-rejoin: it kills pod-0 mid-pg_basebackup → PGDATA
+	// left partial → split-brain guard → restart loop.
+	//
+	// We still emit the config_set for state-tracking (so the
+	// bucket value is recorded by the dispatch's audit trail and
+	// the controller logs reflect what happened); the value
+	// itself was already flushed synchronously via flushPrimaryOrdinal
+	// above so subsequent fetchConfig calls (e.g. by runRejoinCore
+	// inside this same plugin invocation) saw the post-promote
+	// ordinal.
+	//
+	// `noRestart` (operator's --no-restart flag) is checked further
+	// down for the auto-rejoin gate; here it's redundant because
+	// we always skip the bucket-driven restart fan-out.
+
 	actions := []dispatchAction{{
 		Type:        "config_set",
 		Scope:       scope,
 		Name:        name,
 		KV:          map[string]string{primaryOrdinalKey: strconv.Itoa(target)},
-		SkipRestart: noRestart,
+		SkipRestart: true,
 	}}
 
 	// Action 2..N: refresh every linked consumer's DATABASE_URL[/_READ_URL]
@@ -309,13 +325,13 @@ func cmdPromote() error {
 	}
 
 	msg := fmt.Sprintf(
-		"postgres %s: promoted ordinal %d → primary (was %d). Pods rolling top-down; new primary live once ordinal-%d finishes restarting.",
-		refOrName(scope, name), target, current, target,
+		"postgres %s: promoted ordinal %d → primary (was %d). New primary live (pg_promote completed in place — no restart needed).",
+		refOrName(scope, name), target, current,
 	)
 
 	if noRestart {
 		msg = fmt.Sprintf(
-			"postgres %s: promoted ordinal %d → primary (was %d) (--no-restart: bucket + URLs updated, postgres pods NOT rolled).",
+			"postgres %s: promoted ordinal %d → primary (was %d) (--no-restart: bucket + URLs updated, auto-rejoin skipped).",
 			refOrName(scope, name), target, current,
 		)
 	}
@@ -413,10 +429,17 @@ func cmdPromote() error {
 // readCurrentPrimaryOrdinal would return the OLD primary, point
 // pg_rewind at itself, and the auto-rejoin would loop or fail.
 //
+// CRITICAL: passes skipRestart=true. The /config POST endpoint
+// triggers a rolling restart fan-out by default, which would race
+// the auto-rejoin's rebootstrap below and kill pod-0 mid-
+// pg_basebackup → partial PGDATA → split-brain guard → restart
+// loop. The auto-rejoin handles its own targeted pod recreation;
+// no rolling restart is needed for the bucket flip alone.
+//
 // The dispatch envelope at the end of cmdPromote ALSO emits the
-// same config_set action — we keep that for consumers/audit, but
-// the side effect we need pre-rejoin is the etcd write itself.
-// config_set is idempotent so the duplicate emit is harmless.
+// same config_set action with SkipRestart=true — that's for
+// state-tracking/audit, also restart-suppressing for the same
+// reason.
 func flushPrimaryOrdinal(client *controllerClient, scope, name string, ordinal int) error {
 	if client == nil {
 		return fmt.Errorf("controller client unavailable")
@@ -424,7 +447,7 @@ func flushPrimaryOrdinal(client *controllerClient, scope, name string, ordinal i
 
 	return client.patchConfig(scope, name, map[string]string{
 		primaryOrdinalKey: strconv.Itoa(ordinal),
-	})
+	}, true /* skipRestart — auto-rejoin handles its own teardown */)
 }
 
 // readCurrentPrimaryOrdinal pulls PG_PRIMARY_ORDINAL from the
