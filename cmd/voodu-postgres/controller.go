@@ -27,6 +27,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -50,32 +51,70 @@ type dispatchOutput struct {
 	Actions []dispatchAction `json:"actions"`
 }
 
-// readInvocationContext decodes the JSON envelope on stdin.
-// Empty stdin → falls back to env vars so direct CLI invocation
-// (smoke testing without dispatch) still works.
+// resetInvocationContextForTests clears the cached invocation
+// context so tests can re-prime stdin / env vars between cases.
+// Production code never calls this — sync.Once would otherwise
+// pin the first stdin read for the lifetime of the process,
+// which is the desired behaviour for plugin invocations but bad
+// for table-driven tests that swap in different stub servers.
+func resetInvocationContextForTests() {
+	invocationContextOnce = sync.Once{}
+	invocationContextVal = nil
+	invocationContextErr = nil
+}
+
+// invocationContextOnce caches the result of the first stdin read
+// so subsequent callers don't get an empty buffer. The controller
+// writes the envelope to stdin exactly once at process start;
+// io.ReadAll drains it on the first call. Without this cache,
+// commands that chain into other commands' core (e.g. cmdPromote
+// calling runRejoin) hit "no controller_url available" because
+// the second readInvocationContext sees an empty stdin and the
+// env-var fallback isn't set when invoked via dispatch.
+var (
+	invocationContextOnce sync.Once
+	invocationContextVal  *invocationContext
+	invocationContextErr  error
+)
+
+// readInvocationContext decodes the JSON envelope on stdin and
+// caches the result for the lifetime of the process. Empty stdin
+// falls back to env vars so direct CLI invocation (smoke testing
+// without dispatch) still works.
+//
+// Idempotent across calls: subsequent invocations return the same
+// cached context. cmdPromote → runRejoin chains rely on this; any
+// future plugin command that needs to call another command's
+// internal logic gets the same guarantee for free.
 func readInvocationContext() (*invocationContext, error) {
-	raw, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		return nil, fmt.Errorf("read stdin: %w", err)
-	}
-
-	ctx := &invocationContext{}
-
-	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, ctx); err != nil {
-			return nil, fmt.Errorf("decode stdin: %w", err)
+	invocationContextOnce.Do(func() {
+		raw, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			invocationContextErr = fmt.Errorf("read stdin: %w", err)
+			return
 		}
-	}
 
-	if ctx.ControllerURL == "" {
-		ctx.ControllerURL = os.Getenv("VOODU_CONTROLLER_URL")
-	}
+		ctx := &invocationContext{}
 
-	if ctx.PluginDir == "" {
-		ctx.PluginDir = os.Getenv("VOODU_PLUGIN_DIR")
-	}
+		if len(raw) > 0 {
+			if err := json.Unmarshal(raw, ctx); err != nil {
+				invocationContextErr = fmt.Errorf("decode stdin: %w", err)
+				return
+			}
+		}
 
-	return ctx, nil
+		if ctx.ControllerURL == "" {
+			ctx.ControllerURL = os.Getenv("VOODU_CONTROLLER_URL")
+		}
+
+		if ctx.PluginDir == "" {
+			ctx.PluginDir = os.Getenv("VOODU_PLUGIN_DIR")
+		}
+
+		invocationContextVal = ctx
+	})
+
+	return invocationContextVal, invocationContextErr
 }
 
 // writeDispatchOutput encodes the dispatch result inside the

@@ -134,6 +134,8 @@ func TestComposeExposeActions_RefusesWhenReplicasGreaterThanOne(t *testing.T) {
 	}))
 	defer ts.Close()
 
+	resetInvocationContextForTests()
+
 	t.Setenv("VOODU_CONTROLLER_URL", ts.URL)
 
 	_, err := composeExposeActions("clowk-lp", "db", true)
@@ -177,6 +179,8 @@ func TestComposeExposeActions_AllowsUnexposeRegardlessOfReplicas(t *testing.T) {
 }`))
 	}))
 	defer ts.Close()
+
+	resetInvocationContextForTests()
 
 	t.Setenv("VOODU_CONTROLLER_URL", ts.URL)
 
