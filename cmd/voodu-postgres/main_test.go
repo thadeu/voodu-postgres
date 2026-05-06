@@ -87,7 +87,6 @@ func TestComposeStatefulsetDefaults_EnvCarriesPostgresImageContract(t *testing.T
 		"PG_PORT":                 "5433",
 		"PG_NAME":                 "name",
 		"PG_SCOPE_SUFFIX":         ".scope.voodu",
-		"PG_PRIMARY_ORDINAL":      "0",
 		"PG_REPLICATION_USER":     "replicator",
 		"PG_REPLICATION_PASSWORD": "repl-pw",
 	}
@@ -96,6 +95,16 @@ func TestComposeStatefulsetDefaults_EnvCarriesPostgresImageContract(t *testing.T
 		if env[k] != want {
 			t.Errorf("env[%s]: got %v, want %v", k, env[k], want)
 		}
+	}
+
+	// PG_PRIMARY_ORDINAL must NOT appear in spec.env — it lives
+	// in the config bucket only, where promote can flip it without
+	// the controller's "spec.env wins over bucket" merge order
+	// shadowing the update. Operators reading describe see it via
+	// the bucket; the wrapper reads it from container env after
+	// the runtime merge surfaces the bucket value.
+	if _, present := env["PG_PRIMARY_ORDINAL"]; present {
+		t.Errorf("PG_PRIMARY_ORDINAL leaked into spec.env (must live in bucket only — see composeStatefulsetDefaults rationale)")
 	}
 }
 
@@ -251,15 +260,26 @@ func TestComposeStatefulsetDefaults_ScopeSuffixForUnscopedResource(t *testing.T)
 	}
 }
 
-func TestComposeStatefulsetDefaults_PrimaryOrdinalFlowsIntoEnv(t *testing.T) {
-	// M-P5 will flip PG_PRIMARY_ORDINAL via failover; pinning
-	// that the value flows from the parameter into the env.
+// TestComposeStatefulsetDefaults_PrimaryOrdinalNotInSpecEnv pins
+// the invariant that broke promote in M-P5+: PG_PRIMARY_ORDINAL
+// MUST NOT appear in spec.env. The controller's runtime merge has
+// spec.env shadow the bucket — putting the ordinal here would let
+// `vd postgres:promote`'s bucket flip be silently ignored, sending
+// the standby's wrapper to the wrong primary and triggering split-
+// brain. The bucket is the only authority; the wrapper reads it
+// via the container's runtime env (bucket flows through when not
+// shadowed by spec.env).
+//
+// If a future refactor brings the ordinal back into spec.env, this
+// test fails and operators get the same broken-promote loop until
+// it's reverted.
+func TestComposeStatefulsetDefaults_PrimaryOrdinalNotInSpecEnv(t *testing.T) {
 	spec := mustParse(t, nil)
 	got := composeStatefulsetDefaults("s", "n", spec, "pw", "repl-pw", 2, false)
 
 	env := got["env"].(map[string]any)
-	if env["PG_PRIMARY_ORDINAL"] != "2" {
-		t.Errorf("expected PG_PRIMARY_ORDINAL=2, got %v", env["PG_PRIMARY_ORDINAL"])
+	if _, present := env["PG_PRIMARY_ORDINAL"]; present {
+		t.Errorf("PG_PRIMARY_ORDINAL must NOT live in spec.env (controller's spec-over-bucket merge would shadow promote's flip):\n%v", env)
 	}
 }
 

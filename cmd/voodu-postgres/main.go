@@ -500,6 +500,24 @@ func cmdExpand() error {
 		})
 	}
 
+	// Seed PG_PRIMARY_ORDINAL=0 on first apply when absent. The
+	// wrapper defaults to "0" if the env var is unset, but having
+	// it explicit in the bucket makes `vd config get` show the
+	// value, makes promote's flushPrimaryOrdinal a vanilla update
+	// instead of a create, and gives operators a single source of
+	// truth for "who's primary right now?" without spelunking the
+	// wrapper script. Subsequent applies leave the bucket alone —
+	// promote's flips persist.
+	if req.Config[primaryOrdinalKey] == "" {
+		out.Actions = append(out.Actions, dispatchAction{
+			Type:        "config_set",
+			Scope:       req.Scope,
+			Name:        req.Name,
+			KV:          map[string]string{primaryOrdinalKey: "0"},
+			SkipRestart: true, // bucket seed only; no fan-out needed
+		})
+	}
+
 	// Seed the backup retention default on first apply only —
 	// subsequent applies leave the operator's `vd config set
 	// BACKUP_KEEP=…` (or the deliberate "0 = disable" choice)
@@ -585,10 +603,34 @@ func composeStatefulsetDefaults(scope, name string, spec *postgresSpec, password
 		"PG_PORT":                  strconv.Itoa(spec.Port),
 		"PG_NAME":                  name,
 		"PG_SCOPE_SUFFIX":          composeScopeSuffix(scope),
-		"PG_PRIMARY_ORDINAL":       strconv.Itoa(primaryOrdinal),
+		// PG_PRIMARY_ORDINAL is INTENTIONALLY NOT SET in spec.env.
+		// It lives in the config bucket only — `vd postgres:promote`
+		// flips it via config_set, and the controller's runtime env
+		// merge (resolveAppEnv) hands the bucket value to the
+		// container. The wrapper defaults to "0" when the env var
+		// is absent, which matches the fresh-cluster invariant
+		// (pod-0 = primary).
+		//
+		// Why NOT in spec.env: the controller's env merge order is
+		// "bucket first, spec.env wins on conflict". If we put
+		// PG_PRIMARY_ORDINAL=0 in spec.env at expand time, it
+		// permanently shadows any bucket update — operator does
+		// promote → bucket has 1 → merged env still gets 0 from
+		// spec → wrapper sees 0 → split-brain (or wrong primary).
+		// Operator was forced to `vd apply` after every promote to
+		// re-render spec.env from bucket. This invariant move
+		// breaks that loop: bucket is now the only authority.
 		"PG_REPLICATION_USER":      spec.ReplicationUser,
 		"PG_REPLICATION_PASSWORD":  replicationPassword,
 	}
+
+	// primaryOrdinal is no longer consumed inside this function —
+	// it used to land in spec.env above, but that location made
+	// promote's bucket flip ineffective (controller's env merge
+	// puts spec.env over bucket). Kept in the signature so the
+	// caller doesn't have to care; future re-introductions of
+	// per-replica spec emit can pick it up.
+	_ = primaryOrdinal
 
 	healthCheck := fmt.Sprintf("pg_isready -U %s -d %s -p %d", spec.User, spec.Database, spec.Port)
 
