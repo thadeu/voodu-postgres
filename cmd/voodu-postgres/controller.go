@@ -218,6 +218,51 @@ func (c *controllerClient) fetchConfig(scope, name string) (map[string]string, e
 	return env.Data.Vars, nil
 }
 
+// patchConfig writes one or more config bucket keys via the
+// controller's `POST /config?scope=&name=` endpoint. Used by
+// promote's auto-rejoin to flush PG_PRIMARY_ORDINAL synchronously
+// before invoking runRejoin (which reads the same key); the
+// dispatch envelope emits the config_set action again at the end
+// for audit, harmless because config_set is idempotent.
+func (c *controllerClient) patchConfig(scope, name string, kv map[string]string) error {
+	if c.baseURL == "" {
+		return fmt.Errorf("no controller_url available")
+	}
+
+	body, err := json.Marshal(kv)
+	if err != nil {
+		return fmt.Errorf("encode kv: %w", err)
+	}
+
+	u := fmt.Sprintf("%s/config?scope=%s&name=%s",
+		c.baseURL,
+		url.QueryEscape(scope),
+		url.QueryEscape(name),
+	)
+
+	req, err := http.NewRequest(http.MethodPost, u, strings.NewReader(string(body)))
+	if err != nil {
+		return fmt.Errorf("build patch request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("config patch RPC: %w", err)
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("config patch %s/%s: HTTP %d: %s",
+			scope, name, resp.StatusCode, body)
+	}
+
+	return nil
+}
+
 // restartStatefulset triggers a rolling restart of every pod in
 // the named statefulset via `POST /restart?kind=statefulset&...`.
 //

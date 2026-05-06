@@ -92,30 +92,40 @@ WHAT IT DOES
   6. Rolling restart of postgres pods so they re-read
      streaming.conf with the new primary_conninfo (unless
      --no-restart).
+  7. AUTO-REJOIN — chains a rejoin call on the OLD primary so it
+     comes back as a fresh standby of the new primary. Single-
+     command failover; no manual rejoin step required.
 
-POST-PROMOTE
-  The OLD primary's pod won't restart cleanly — the wrapper's
-  split-brain guard catches "no standby.signal but designated as
-  standby" and exits 1. Recover with:
+WHY AUTO-REJOIN
+  Without it, the old primary's wrapper detects "PGDATA in primary
+  state but spec says STANDBY" (split-brain guard) and exits in a
+  loop. The auto-rejoin runs pg_rewind first (preserves the small
+  divergence between the two primaries' WAL); on failure (typical
+  when WAL has diverged enough), it auto-falls back to wiping the
+  old primary's volume and re-cloning via pg_basebackup. Either
+  way the cluster ends with both pods serving.
+
+  Skipped under --no-restart so staged failovers can manually
+  decide when to rejoin the old primary.
+
+  If auto-rejoin fails for any reason (rare), the rest of the
+  promote still succeeded; operator can run rejoin manually:
 
     vd postgres:rejoin <postgres-scope/name> --replica <old-ordinal>
 
-  That runs pg_rewind, arms standby.signal, and brings the pod
-  back as a standby of the new primary. Manual on purpose:
-  pg_rewind silently drops orphaned writes; operator decides
-  whether to pg_dump the old primary first.
-
 EXAMPLES
-  # Standard promote (refuses if any standby is behind)
+  # Standard promote (refuses if any standby is behind).
+  # Auto-rejoins the old primary at the end — single command.
   vd postgres:promote clowk-lp/db --replica 1
-  vd postgres:rejoin   clowk-lp/db --replica 0
 
-  # Force promote despite replication lag (data loss accepted)
+  # Force promote despite replication lag (data loss accepted).
   vd postgres:promote clowk-lp/db --replica 1 --force
 
-  # Staged: flip + refresh URLs but don't roll the pods yet
+  # Staged: flip + refresh URLs but don't roll the pods yet.
+  # Skips auto-rejoin too — operator runs rejoin manually later.
   vd postgres:promote clowk-lp/db --replica 1 --no-restart
-  vd restart clowk-lp/db   # later, when ready
+  vd restart clowk-lp/db                    # later, when ready
+  vd postgres:rejoin clowk-lp/db --replica 0
 
 NOTES
   - replicas must be > 1; can't promote on a single-replica cluster.
@@ -299,10 +309,8 @@ func cmdPromote() error {
 	}
 
 	msg := fmt.Sprintf(
-		"postgres %s: promoted ordinal %d → primary (was %d). Pods rolling top-down; new primary live once ordinal-%d finishes restarting. "+
-			"OLD primary (ordinal-%d) needs `vd pg:rejoin %s --replica %d` to recover as standby.",
+		"postgres %s: promoted ordinal %d → primary (was %d). Pods rolling top-down; new primary live once ordinal-%d finishes restarting.",
 		refOrName(scope, name), target, current, target,
-		current, refOrName(scope, name), current,
 	)
 
 	if noRestart {
@@ -316,9 +324,93 @@ func cmdPromote() error {
 		msg = fmt.Sprintf("%s Refreshed %d linked consumer URL(s).", msg, refreshed)
 	}
 
+	// Auto-rejoin the OLD primary as a fresh standby of the new one
+	// — single-command failover. Without this, the old primary
+	// hits the wrapper's split-brain guard (PGDATA in primary state
+	// + spec says STANDBY) and exits in a loop until the operator
+	// runs rejoin manually.
+	//
+	// runRejoin is idempotent: if pg_rewind succeeds, data on old
+	// primary is preserved across the rewind; if it fails (most
+	// common after promote because WAL has diverged), the new
+	// auto-fallback wipes the old primary's volume and re-clones
+	// via pg_basebackup. Either way the cluster ends with both
+	// pods serving — no further operator steps required.
+	//
+	// Skipped under --no-restart: that flag is for staged failovers
+	// where the operator wants to flip the bucket but defer pod
+	// rolling; auto-rejoin would cut against that intent.
+	autoRejoinErr := error(nil)
+
+	if !noRestart {
+		fmt.Fprintf(os.Stderr, "promote: auto-rejoining old primary (ordinal %d) as standby of new primary (ordinal %d)\n",
+			current, target)
+
+		// Emit the bucket + URL actions FIRST so the controller
+		// sees the new PG_PRIMARY_ORDINAL before runRejoin queries
+		// for it. We achieve that by pre-writing actions via the
+		// dispatch round-trip would normally do at the end — but
+		// the rejoin needs to read fresh state. Easiest path: emit
+		// the actions in two passes. Today we accumulate them and
+		// emit once at the end; the rejoin runs against state that
+		// MAY still show the old primary ordinal. To avoid that
+		// race we synthesise a controller-side flush by issuing a
+		// direct config_set RPC for PG_PRIMARY_ORDINAL right now,
+		// then let the dispatch envelope re-emit it idempotently.
+		if err := flushPrimaryOrdinal(client, scope, name, target); err != nil {
+			fmt.Fprintf(os.Stderr,
+				"promote: warn — flushing PG_PRIMARY_ORDINAL pre-rejoin failed (%v); proceeding anyway, runRejoin will read whatever the bucket has\n",
+				err)
+		}
+
+		autoRejoinErr = runRejoin(scope, name, current)
+		if autoRejoinErr != nil {
+			// Old primary failed to rejoin. The promote ITSELF
+			// succeeded (new primary is live, bucket flipped, URLs
+			// refreshed). Surface the failure as a warning in the
+			// success message so the operator can run rejoin
+			// manually with diagnostics.
+			fmt.Fprintf(os.Stderr,
+				"promote: warn — auto-rejoin of ordinal %d failed: %v\n",
+				current, autoRejoinErr)
+
+			msg = fmt.Sprintf("%s\n⚠  Auto-rejoin of OLD primary (ordinal %d) FAILED: %v\n   Run manually: vd pg:rejoin %s --replica %d",
+				msg, current, autoRejoinErr, refOrName(scope, name), current)
+		} else {
+			msg = fmt.Sprintf("%s\nOLD primary (ordinal %d) auto-rejoined as standby.",
+				msg, current)
+		}
+	} else {
+		// --no-restart: keep the breadcrumb so the operator knows
+		// they need to run rejoin themselves once they're ready.
+		msg = fmt.Sprintf("%s\nOLD primary (ordinal %d) needs `vd pg:rejoin %s --replica %d` to recover as standby (skipped under --no-restart).",
+			msg, current, refOrName(scope, name), current)
+	}
+
 	return writeDispatchOutput(dispatchOutput{
 		Message: msg,
 		Actions: actions,
+	})
+}
+
+// flushPrimaryOrdinal writes PG_PRIMARY_ORDINAL=<target> to the
+// postgres config bucket via a direct controller RPC so subsequent
+// reads (e.g. runRejoin's fetchConfig) see the post-promote
+// primary ordinal. Without this flush, runRejoin's
+// readCurrentPrimaryOrdinal would return the OLD primary, point
+// pg_rewind at itself, and the auto-rejoin would loop or fail.
+//
+// The dispatch envelope at the end of cmdPromote ALSO emits the
+// same config_set action — we keep that for consumers/audit, but
+// the side effect we need pre-rejoin is the etcd write itself.
+// config_set is idempotent so the duplicate emit is harmless.
+func flushPrimaryOrdinal(client *controllerClient, scope, name string, ordinal int) error {
+	if client == nil {
+		return fmt.Errorf("controller client unavailable")
+	}
+
+	return client.patchConfig(scope, name, map[string]string{
+		primaryOrdinalKey: strconv.Itoa(ordinal),
 	})
 }
 

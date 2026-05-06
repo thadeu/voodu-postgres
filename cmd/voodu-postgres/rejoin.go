@@ -67,6 +67,21 @@ const rejoinHelp = `vd postgres:rejoin — re-attach a divergent pod as standby 
 USAGE
   vd postgres:rejoin <postgres-scope/name> --replica <N>
 
+WHEN TO USE THIS DIRECTLY
+  Most operators NEVER run this command — vd postgres:promote chains
+  rejoin automatically on the old primary, so single-command failover
+  ends with both pods healthy.
+
+  You only run rejoin manually when:
+    - You used --no-restart on promote (auto-rejoin was skipped).
+    - The auto-rejoin failed mid-flight (rare; check promote output).
+    - A pod's PGDATA got into split-brain state for non-promote
+      reasons (manual docker fiddling, host crash mid-failover, etc.)
+      and you want to reattach it without a full delete + apply.
+
+  In all other cases, use vd postgres:promote and let it handle the
+  full failover.
+
 ARGUMENTS
   <postgres-scope/name>   The postgres cluster.
 
@@ -142,6 +157,21 @@ func cmdRejoin() error {
 		return fmt.Errorf("invalid ref %q (expected scope/name)", positional[0])
 	}
 
+	return runRejoin(scope, name, target)
+}
+
+// runRejoin is the core rejoin orchestration callable from any
+// command that needs to reattach a divergent pod as standby.
+// cmdRejoin parses argv and delegates here; cmdPromote chains it
+// in directly so the failover flow ends with a single command —
+// no separate rejoin step on the OLD primary.
+//
+// Owns the full lifecycle: spec/config fetch, validation, container
+// stop, pg_rewind attempt, auto-fallback to rebootstrap on rewind
+// failure, standby.signal arming, container restart. Writes the
+// dispatch envelope at the end so the operator sees the same
+// success message regardless of which entry point invoked it.
+func runRejoin(scope, name string, target int) error {
 	ctx, err := readInvocationContext()
 	if err != nil {
 		return err
