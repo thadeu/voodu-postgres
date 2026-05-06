@@ -158,15 +158,27 @@ if [ "$ORDINAL" != "$PRIMARY_ORDINAL" ]; then
     # PGDATA with PG_VERSION but no standby.signal → split-brain
     # guard fires → restart loop → operator stuck. With it, the
     # wrapper recovers automatically on the next boot.
-    bootstrap_sentinel="$PGDATA/.voodu-bootstrap-incomplete"
+    #
+    # Sentinel lives in PGDATA's PARENT (the docker volume root,
+    # which IS the mount point and always exists). Putting it
+    # inside PGDATA itself wouldn't work because PGDATA is a
+    # SUBDIR that doesn't exist until pg_basebackup creates it on
+    # first boot — touch would fail with "No such file or
+    # directory". Sentinel in the parent also has the bonus
+    # property of surviving the find -delete wipe of PGDATA's
+    # contents, so we don't accidentally erase our own marker
+    # mid-recovery.
+    pgdata_parent="$(dirname "$PGDATA")"
+    bootstrap_sentinel="$pgdata_parent/.voodu-bootstrap-incomplete"
 
     if [ -f "$bootstrap_sentinel" ]; then
         log "bootstrap sentinel found — previous pg_basebackup was interrupted, wiping PGDATA contents and retrying"
 
         # Delete every entry under PGDATA (files + dotfiles + dirs)
-        # but NOT the directory itself (it's the volume mount point;
-        # removing it would break the mount). find -mindepth 1
-        # excludes PGDATA itself.
+        # but NOT the directory itself (it's part of the volume
+        # tree; removing it could confuse the docker mount). find
+        # -mindepth 1 excludes PGDATA itself; missing PGDATA is
+        # tolerated via the 2>/dev/null guard (first-boot case).
         find "$PGDATA" -mindepth 1 -delete 2>/dev/null || true
     fi
 
